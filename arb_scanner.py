@@ -18,6 +18,7 @@ Strict Execution Rules:
 
 import os
 import sys
+import re
 import math
 import calendar
 import argparse
@@ -711,25 +712,50 @@ def format_telegram_report(
     return f"{header}\n\n{content}\n\n{footer}"
 
 
+def escape_telegram_html(text: str) -> str:
+    """
+    Escapes raw <, >, and & characters for Telegram HTML parse_mode
+    while preserving supported Telegram tags (<b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>, <a>, </a>).
+    """
+    pattern = r"</?(?:b|i|code|pre|a)(?:\s+[^>]+)?>"
+    placeholder_map = {}
+
+    def repl_tag(m):
+        tok = f"___TAG_HOLD_{len(placeholder_map)}___"
+        placeholder_map[tok] = m.group(0)
+        return tok
+
+    tokenized = re.sub(pattern, repl_tag, text, flags=re.IGNORECASE)
+    tokenized = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", tokenized)
+    tokenized = tokenized.replace("<", "&lt;").replace(">", "&gt;")
+    for tok, orig in placeholder_map.items():
+        tokenized = tokenized.replace(tok, orig)
+
+    return tokenized
+
+
 def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool:
     """Delivers HTML report to Telegram chat."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    sanitized_html = escape_telegram_html(message_html)
     payload = {
         "chat_id": chat_id,
-        "text": message_html,
+        "text": sanitized_html,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     try:
-        r = requests.post(url, json=payload, timeout=20)
+        r = requests.post(url, json=payload, timeout=25)
+        print(f"[TELEGRAM] HTTP Status: {r.status_code}")
+        print(f"[TELEGRAM] API Response: {r.text}")
         if r.status_code == 200 and r.json().get("ok"):
             print("[TELEGRAM] Arbitrage radar summary delivered successfully.")
             return True
         else:
-            print(f"[TELEGRAM] Warning: sendMessage failed ({r.status_code}): {r.text}")
+            print(f"[TELEGRAM] Error: sendMessage failed with HTTP {r.status_code}: {r.text}")
             return False
     except Exception as e:
-        print(f"[TELEGRAM] Error sending telegram notification: {e}")
+        print(f"[TELEGRAM] Exception sending telegram notification: {e}")
         return False
 
 
@@ -915,9 +941,13 @@ def run_arb_radar(session_name: str = "EVENING", no_telegram: bool = False, test
         print("[TELEGRAM] --no-telegram supplied. Dispatch skipped.")
     elif tg_token and tg_chat_id:
         print(f"[TELEGRAM] Dispatching alert to Chat ID {tg_chat_id}...")
-        send_telegram_alert(tg_token, tg_chat_id, telegram_msg)
+        success = send_telegram_alert(tg_token, tg_chat_id, telegram_msg)
+        if not success:
+            print("[TELEGRAM] CRITICAL: Failed to deliver Telegram notification. Exiting with status 1.")
+            sys.exit(1)
     else:
-        print("[TELEGRAM] Warning: Telegram credentials not configured. Dispatch skipped.")
+        print("[TELEGRAM] CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from environment. Exiting with status 1.")
+        sys.exit(1)
 
     duration = (datetime.datetime.now(BANGKOK_TZ) - start_time).total_seconds()
     print("=" * 75)

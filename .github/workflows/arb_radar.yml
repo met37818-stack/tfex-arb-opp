@@ -9,13 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       session:
-        description: 'Trading Session to scan (MIDDAY or EVENING)'
+        description: 'Trading Session to scan (MIDDAY, EVENING, or TEST)'
         required: true
         default: 'EVENING'
         type: choice
         options:
           - MIDDAY
           - EVENING
+          - TEST
 
 jobs:
   run-arbitrage-radar:
@@ -56,4 +57,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "Scanning TFEX Intraday Arbitrage for Session: ${{ steps.sess.outputs.target_session }}"
-          python arb_scanner.py --session ${{ steps.sess.outputs.target_session }}
+          if [ "${{ steps.sess.outputs.target_session }}" = "TEST" ]; then
+            python arb_scanner.py --test
+          else
+            python arb_scanner.py --session ${{ steps.sess.outputs.target_session }}
+          fi
