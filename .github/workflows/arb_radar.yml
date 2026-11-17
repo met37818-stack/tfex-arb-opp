@@ -2,25 +2,34 @@ name: TFEX Intraday Arbitrage Radar
 
 on:
   schedule:
-    # 12:38 BKK (UTC+7) = 05:38 UTC (Mon-Fri) -> MIDDAY Session
-    - cron: '38 5 * * 1-5'
-    # 17:08 BKK (UTC+7) = 10:08 UTC (Mon-Fri) -> EVENING Session
-    - cron: '8 10 * * 1-5'
+    # Morning Session Worker (09:45 - 12:36 BKK):
+    # Primary trigger: 09:45 BKK (02:45 UTC)
+    - cron: '45 2 * * 1-5'
+    # Backup trigger:  10:00 BKK (03:00 UTC) - backup if primary runner was queued/delayed
+    - cron: '0 3 * * 1-5'
+    # Afternoon Session Worker (14:10 - 17:06 BKK):
+    # Primary trigger: 14:10 BKK (07:10 UTC)
+    - cron: '10 7 * * 1-5'
+    # Backup trigger:  14:25 BKK (07:25 UTC) - backup if primary runner was queued/delayed
+    - cron: '25 7 * * 1-5'
   workflow_dispatch:
     inputs:
       session:
-        description: 'Trading Session to scan (MIDDAY or EVENING)'
+        description: 'Trading Session to scan (MORNING_WORKER, AFTERNOON_WORKER, MIDDAY, or EVENING)'
         required: true
-        default: 'EVENING'
+        default: 'MORNING_WORKER'
         type: choice
         options:
+          - MORNING_WORKER
+          - AFTERNOON_WORKER
           - MIDDAY
           - EVENING
 
 jobs:
   run-arbitrage-radar:
+    name: TFEX Arbitrage Radar Worker
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 240
 
     steps:
       - name: Check out repository
@@ -42,8 +51,10 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "target_session=${{ github.event.inputs.session }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.schedule }}" = "38 5 * * 1-5" ]; then
-            echo "target_session=MIDDAY" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "45 2 * * 1-5" ] || [ "${{ github.event.schedule }}" = "0 3 * * 1-5" ]; then
+            echo "target_session=MORNING_WORKER" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "10 7 * * 1-5" ] || [ "${{ github.event.schedule }}" = "25 7 * * 1-5" ]; then
+            echo "target_session=AFTERNOON_WORKER" >> $GITHUB_OUTPUT
           else
             echo "target_session=EVENING" >> $GITHUB_OUTPUT
           fi

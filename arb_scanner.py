@@ -7,6 +7,14 @@ real executable arbitrage opportunities across:
 2. Vertical Spread Monotonicity Violations (Call & Put)
 3. Calendar Spread Spikes (Front vs Next Quarter Futures)
 
+Modes:
+- Real-time Worker (--session MORNING_WORKER / AFTERNOON_WORKER):
+  Runs a 15-minute pulse loop (:00, :15, :30, :45 + 10s offset).
+  Anti-Spam: Alerts to Telegram ONLY when net profit > 0 is detected.
+  At session end (12:35 / 17:05): Dispatches full session summary report to Telegram.
+- Single-Shot (--session MIDDAY / EVENING):
+  Runs full session scan and immediately outputs summary report.
+
 Strict Fail-Loud / No Silent Fallback Rules:
 - Real Turso Data Only: Never generate synthetic/mock quotes.
 - Abort on 0 Rows: If Turso has 0 futures or options rows, send Telegram abort alert and exit.
@@ -27,7 +35,8 @@ import math
 import calendar
 import argparse
 import datetime
-from datetime import date, time
+import time as pytime
+from datetime import date, time, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 
 import requests
@@ -66,7 +75,6 @@ def to_turso_arg(val: Any) -> Dict[str, Any]:
 
 
 def parse_turso_result_rows(res: Dict[str, Any]) -> List[List[Any]]:
-    cols = [c["name"] for c in res.get("cols", [])]
     rows = []
     for raw_row in res.get("rows", []):
         row_vals = []
@@ -120,14 +128,70 @@ def execute_turso_sql(
 
 
 # ==============================================================================
-# 2. DYNAMIC SERIES & EXPIRATION CALCULATION
+# 2. CONCURRENCY GUARD & HEARTBEAT
+# ==============================================================================
+
+def ensure_arb_heartbeat_table(pipeline_url: str, auth_token: str) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS arb_worker_heartbeat (
+        worker_session TEXT PRIMARY KEY,
+        last_heartbeat_bkk TEXT,
+        pid INTEGER
+    );
+    """
+    execute_turso_sql(pipeline_url, auth_token, sql)
+
+
+def is_arb_worker_active(
+    pipeline_url: str,
+    auth_token: str,
+    session_name: str,
+    now_bkk: datetime.datetime,
+    max_age_seconds: int = 180
+) -> bool:
+    """
+    Checks if another worker is running for the same session.
+    Returns True if heartbeat was updated within max_age_seconds (default 3 min).
+    """
+    try:
+        ensure_arb_heartbeat_table(pipeline_url, auth_token)
+        sql = "SELECT last_heartbeat_bkk FROM arb_worker_heartbeat WHERE worker_session = ?;"
+        _, rows = execute_turso_sql(pipeline_url, auth_token, sql, [session_name])
+        if rows and rows[0][0]:
+            last_ts_str = str(rows[0][0])
+            last_dt = BANGKOK_TZ.localize(datetime.datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S"))
+            diff_sec = (now_bkk - last_dt).total_seconds()
+            if 0 <= diff_sec < max_age_seconds:
+                print(f"[CONCURRENCY] Found active worker heartbeat at {last_ts_str} ({diff_sec:.0f}s ago < {max_age_seconds}s limit).")
+                return True
+    except Exception as e:
+        print(f"[CONCURRENCY] Note checking arb heartbeat: {e}")
+    return False
+
+
+def record_arb_heartbeat(
+    pipeline_url: str,
+    auth_token: str,
+    session_name: str,
+    now_bkk: datetime.datetime
+) -> None:
+    try:
+        ensure_arb_heartbeat_table(pipeline_url, auth_token)
+        sql = """
+        INSERT OR REPLACE INTO arb_worker_heartbeat (worker_session, last_heartbeat_bkk, pid)
+        VALUES (?, ?, ?);
+        """
+        now_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+        execute_turso_sql(pipeline_url, auth_token, sql, [session_name, now_str, os.getpid()])
+    except Exception as e:
+        print(f"[CONCURRENCY] Note recording arb heartbeat: {e}")
+
+
+# ==============================================================================
+# 3. DYNAMIC SERIES & EXPIRATION CALCULATION
 # ==============================================================================
 
 def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
-    """
-    Business day immediately preceding the last business day of the contract month.
-    Trading ceases at 16:30 hrs.
-    """
     _, last_day = calendar.monthrange(year, month)
     biz_days = [
         date(year, month, d)
@@ -142,7 +206,6 @@ def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
 
 
 def resolve_active_series_candidates(now_bkk: datetime.datetime) -> Tuple[List[str], str, str]:
-    """Resolves active quarterly series without hardcoding."""
     curr_year = now_bkk.year
     candidates = []
     for y in [curr_year, curr_year + 1]:
@@ -159,7 +222,6 @@ def resolve_active_series_candidates(now_bkk: datetime.datetime) -> Tuple[List[s
 
 
 def parse_series_expiry(series_code: str, ref_date: date) -> datetime.datetime:
-    """Parses series code e.g. 'Z26' -> last trading datetime."""
     month_char = series_code[0].upper()
     month = REVERSE_MONTH_CODES.get(month_char)
     if not month:
@@ -171,14 +233,10 @@ def parse_series_expiry(series_code: str, ref_date: date) -> datetime.datetime:
 
 
 # ==============================================================================
-# 3. TURSO INTRADAY DATASET LOADER (STRICT VALIDATION)
+# 4. TURSO INTRADAY DATASET LOADER (STRICT VALIDATION)
 # ==============================================================================
 
 def fetch_thor_rate(pipeline_url: str, auth_token: str) -> float:
-    """
-    Fetches the latest official BOT THOR interest rate from eod_thor_rates.
-    Strict validation: Raises ValueError if missing, NULL, or rate <= 0.
-    """
     sql_thor = "SELECT thor_rate FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"
     _, rows_thor = execute_turso_sql(pipeline_url, auth_token, sql_thor)
     if not rows_thor or rows_thor[0][0] is None:
@@ -188,7 +246,6 @@ def fetch_thor_rate(pipeline_url: str, auth_token: str) -> float:
     if val <= 0:
         raise ValueError(f"Invalid THOR rate in eod_thor_rates: {val} (must be > 0)")
     
-    # If percentage e.g. 2.25, convert to decimal 0.0225
     rate = val / 100.0 if val > 0.5 else val
     return rate
 
@@ -200,18 +257,9 @@ def fetch_intraday_arb_dataset(
     start_time_bkk: str,
     end_time_bkk: str
 ) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
-    """
-    Fetches synchronized 1-minute intraday snapshots for Spot, Futures, Options.
-    Strict Bid/Ask: Drops invalid quotes (bid<=0, ask<=0, vol<=0, ask<bid).
-    Returns:
-    - grouped_data: {timestamp_str: {"spot": ..., "futures": {...}, "options": {...}}}
-    - total_rows_fut: int
-    - total_rows_opt: int
-    """
     ts_start = f"{trade_date} {start_time_bkk}"
     ts_end = f"{trade_date} {end_time_bkk}"
 
-    # 1. Fetch Spot Snapshots
     sql_spot = """
     SELECT captured_at_bkk, last, volume, value 
     FROM spot_snapshots 
@@ -220,7 +268,6 @@ def fetch_intraday_arb_dataset(
     """
     _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [ts_start, ts_end])
 
-    # 2. Fetch Futures Snapshots
     sql_fut = """
     SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest 
     FROM futures_snapshots 
@@ -229,7 +276,6 @@ def fetch_intraday_arb_dataset(
     """
     _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [ts_start, ts_end])
 
-    # 3. Fetch Options Snapshots
     sql_opt = """
     SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest 
     FROM options_snapshots 
@@ -238,7 +284,6 @@ def fetch_intraday_arb_dataset(
     """
     _, rows_opt = execute_turso_sql(pipeline_url, auth_token, sql_opt, [ts_start, ts_end])
 
-    # Synchronize by exact timestamp (captured_at_bkk)
     grouped: Dict[str, Dict[str, Any]] = {}
 
     for r in rows_spot:
@@ -282,7 +327,7 @@ def fetch_intraday_arb_dataset(
 
 
 # ==============================================================================
-# 4. THREE INTRADAY ARBITRAGE SCAN MODULES (STRICT VALIDATION)
+# 5. THREE INTRADAY ARBITRAGE SCAN MODULES (STRICT BLACK-76 VALIDATION)
 # ==============================================================================
 
 def scan_put_call_parity(
@@ -291,13 +336,6 @@ def scan_put_call_parity(
     thor_rate: float,
     T_years: float
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
-    """
-    Module 1: Put-Call Parity Arbitrage (Black-76 Futures Options).
-    Commission Hurdle: 0.60 index points (3 legs * 0.20 pts).
-    Formula: discounted_diff = (F - K) * exp(-r * T)
-    - Conversion: gross_profit = (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
-    - Reversal:   gross_profit = (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
-    """
     COMMISSION = COMMISSION_3LEG_PTS
     fut_sym = f"S50{front_series}"
     disc_factor = math.exp(-thor_rate * T_years)
@@ -318,7 +356,6 @@ def scan_put_call_parity(
         f_ask = fut.get("ask")
         f_vol = fut.get("volume", 0.0)
 
-        # Strict bid/ask/vol validation: Never use last price
         if (f_bid is None or f_ask is None or f_bid <= 0 or f_ask <= 0 or
             f_vol <= 0 or f_ask < f_bid):
             dropped_invalid_quotes += 1
@@ -326,7 +363,6 @@ def scan_put_call_parity(
 
         ref_price = spot_ref or ((f_bid + f_ask) / 2.0)
 
-        # Find all available strikes in front series
         strikes = set()
         for (ser, k, otype) in frame["options"].keys():
             if ser == front_series:
@@ -342,7 +378,6 @@ def scan_put_call_parity(
             p_bid, p_ask = p_quote.get("bid"), p_quote.get("ask")
             c_vol, p_vol = c_quote.get("volume", 0.0), p_quote.get("volume", 0.0)
 
-            # Strict bid/ask/vol validation: Never use last price
             if (c_bid is None or c_ask is None or c_bid <= 0 or c_ask <= 0 or
                 c_vol <= 0 or c_ask < c_bid):
                 dropped_invalid_quotes += 1
@@ -355,11 +390,7 @@ def scan_put_call_parity(
             max_sets = int(min(c_vol, p_vol, f_vol))
             liq_tag = "[Liquid: Spot±30]" if abs(k - ref_price) <= 30.0 else "[Deep Strike: ถือจนหมดอายุ]"
 
-            # ------------------------------------------------------------------
-            # Strategy 1: Conversion
-            # Sell Call @ c_bid, Buy Put @ p_ask, Buy Futures @ f_ask
-            # gross_profit = (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
-            # ------------------------------------------------------------------
+            # 1. Conversion: (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
             try:
                 disc_diff_conv = (f_ask - k) * disc_factor
                 gross_conv = (c_bid - p_ask) - disc_diff_conv
@@ -394,11 +425,7 @@ def scan_put_call_parity(
                     if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
                         best_near_miss = item_conv
 
-            # ------------------------------------------------------------------
-            # Strategy 2: Reversal
-            # Buy Call @ c_ask, Sell Put @ p_bid, Sell Futures @ f_bid
-            # gross_profit = (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
-            # ------------------------------------------------------------------
+            # 2. Reversal: (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
             try:
                 disc_diff_rev = (f_bid - k) * disc_factor
                 gross_rev = disc_diff_rev - (c_ask - p_bid)
@@ -440,14 +467,6 @@ def scan_vertical_spreads(
     grouped_data: Dict[str, Dict[str, Any]],
     front_series: str
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
-    """
-    Module 2: Vertical Spread Monotonicity Violations.
-    Commission Hurdle: 0.40 index points (2 legs * 0.20 pts).
-    - Call Monotonicity: For K1 < K2, if Call_Ask(K1) < Call_Bid(K2).
-      Buy K1 @ Ask, Sell K2 @ Bid. Net credit = Call_Bid(K2) - Call_Ask(K1) - 0.40.
-    - Put Monotonicity: For K1 < K2, if Put_Ask(K2) < Put_Bid(K1).
-      Buy K2 @ Ask, Sell K1 @ Bid. Net credit = Put_Bid(K1) - Put_Ask(K2) - 0.40.
-    """
     COMMISSION = COMMISSION_2LEG_PTS
     opportunities: List[Dict[str, Any]] = []
     best_near_miss: Optional[Dict[str, Any]] = None
@@ -458,7 +477,7 @@ def scan_vertical_spreads(
         frame = grouped_data[ts]
         options = frame["options"]
 
-        # 1. Evaluate Call Vertical Monotonicity
+        # Call Monotonicity
         calls = []
         for ((ser, k, otype), opt) in options.items():
             if ser == front_series and otype == "C":
@@ -502,7 +521,7 @@ def scan_vertical_spreads(
                     if best_near_miss is None or net > best_near_miss["net_pts"]:
                         best_near_miss = item
 
-        # 2. Evaluate Put Vertical Monotonicity
+        # Put Monotonicity
         puts = []
         for ((ser, k, otype), opt) in options.items():
             if ser == front_series and otype == "P":
@@ -554,11 +573,6 @@ def scan_calendar_spreads(
     front_series: str,
     next_series: str
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
-    """
-    Module 3: Calendar Spread Spike (Front vs Next Quarter Futures).
-    Commission Hurdle: 0.40 index points (2 legs * 0.20 pts).
-    Evaluates Front - Next calendar spread against intraday rolling mean +- 2 SD.
-    """
     COMMISSION = COMMISSION_2LEG_PTS
     f1_sym = f"S50{front_series}"
     f2_sym = f"S50{next_series}"
@@ -675,11 +689,126 @@ def scan_calendar_spreads(
 
 
 # ==============================================================================
-# 5. TELEGRAM HTML FORMATTER & ALERT DISPATCHER
+# 6. TELEGRAM HTML FORMATTER & ALERT DISPATCHER
 # ==============================================================================
 
+def escape_telegram_html(text: str) -> str:
+    pattern = r"</?(?:b|i|code|pre|a)(?:\s+[^>]+)?>"
+    placeholder_map = {}
+
+    def repl_tag(m):
+        tok = f"___TAG_HOLD_{len(placeholder_map)}___"
+        placeholder_map[tok] = m.group(0)
+        return tok
+
+    tokenized = re.sub(pattern, repl_tag, text, flags=re.IGNORECASE)
+    tokenized = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", tokenized)
+    tokenized = tokenized.replace("<", "&lt;").replace(">", "&gt;")
+    for tok, orig in placeholder_map.items():
+        tokenized = tokenized.replace(tok, orig)
+
+    return tokenized
+
+
+def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    sanitized_html = escape_telegram_html(message_html)
+    payload = {
+        "chat_id": chat_id,
+        "text": sanitized_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=25)
+        print(f"[TELEGRAM] HTTP Status: {r.status_code}")
+        print(f"[TELEGRAM] API Response: {r.text}")
+        if r.status_code == 200 and r.json().get("ok"):
+            print("[TELEGRAM] Arbitrage notification delivered successfully.")
+            return True
+        else:
+            print(f"[TELEGRAM] Error: sendMessage failed with HTTP {r.status_code}: {r.text}")
+            return False
+    except Exception as e:
+        print(f"[TELEGRAM] Exception sending telegram notification: {e}")
+        return False
+
+
+def format_15min_pulse_alert(
+    trade_date: str,
+    window_start: str,
+    window_end: str,
+    profitable_opps: List[Dict[str, Any]],
+    thor_rate: float,
+    dte: int,
+    T_years: float,
+    dropped_invalid_quotes: int,
+    calc_error_count: int,
+    valid_minutes: int
+) -> str:
+    """Formats 15-minute real-time alert for Telegram (only when net profit > 0)."""
+    header = (
+        f"🚨 <b>[15-MIN ARB ALERT] พบโอกาส Arbitrage ระหว่างวัน!</b>\n"
+        f"📅 <i>ข้อมูลวันที่ {trade_date} | สแกนช่วง {window_start}–{window_end} น.</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    ranked = sorted(profitable_opps, key=lambda x: x["net_pts"], reverse=True)
+    top_3 = ranked[:3]
+
+    parity_cnt = sum(1 for x in profitable_opps if "Conversion" in x["strategy"] or "Reversal" in x["strategy"])
+    vertical_cnt = sum(1 for x in profitable_opps if "Monotonicity" in x["strategy"])
+    calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
+
+    meta_stats = (
+        f"• <b>บาร์ข้อมูลที่ประมวลผล:</b> {valid_minutes} นาที\n"
+        f"• <b>กรองข้อมูลไม่สมบูรณ์:</b> {dropped_invalid_quotes:,} รายการ\n"
+        f"• <b>อัตราดอกเบี้ย THOR:</b> {thor_rate*100.0:.2f}% | <b>DTE:</b> {dte} วัน"
+    )
+
+    summary_sec = (
+        f"🎯 <b>สรุปโอกาสที่พบ ({len(profitable_opps)} ครั้ง ใน 15 นาทีล่าสุด):</b>\n"
+        f"• <b>Put-Call Parity (Black-76):</b> {parity_cnt} ครั้ง\n"
+        f"• <b>Vertical Spread:</b> {vertical_cnt} ครั้ง\n"
+        f"• <b>Calendar Spread Spike:</b> {calendar_cnt} ครั้ง\n"
+        f"{meta_stats}\n"
+        f"───────────────────────\n"
+        f"🏆 <b>โอกาสกำไรสุทธิสูงสุด:</b>\n"
+    )
+
+    medals = ["🥇 [1]", "🥈 [2]", "🥉 [3]"]
+    opp_blocks = []
+    for idx, opp in enumerate(top_3):
+        medal = medals[idx] if idx < len(medals) else f"• [{idx+1}]"
+        net_pts = opp["net_pts"]
+        net_thb_per_set = net_pts * CONTRACT_MULTIPLIER
+        m_sets = opp["max_sets"]
+        tot_thb = net_thb_per_set * m_sets if m_sets > 0 else net_thb_per_set
+
+        legs_str = "\n".join([f"    - {leg}" for leg in opp["legs"]])
+        stats_line = f"\n  • <b>สถิติ:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
+
+        block = (
+            f"{medal} <b>{opp['strategy']} | {opp['target']} {opp.get('tag', '')}</b>\n"
+            f"  • <b>เวลาที่เกิด:</b> <code>{opp['time']}</code>\n"
+            f"  • <b>ขาการเทรด (Strict Bid/Ask):</b>\n{legs_str}\n"
+            f"  • <b>ปริมาณที่เปิดได้ (Executable):</b> <b>{m_sets}</b> ชุด (min leg vol){stats_line}\n"
+            f"  • <b>กำไรสุทธิต่อชุด:</b> 🟢 <b>+{net_pts:.2f} จุด</b> (+{net_thb_per_set:,.0f} บาท/ชุด)\n"
+            f"  • <b>มูลค่ากำไรรวม:</b> <b>+{tot_thb:,.0f} บาท</b> (หักค่าคอม {opp['commission_pts']:.2f} จุดแล้ว)"
+        )
+        opp_blocks.append(block)
+
+    content = summary_sec + "\n\n".join(opp_blocks)
+    footer = (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <i>TFEX Arbitrage Real-time Pulse | แจ้งเตือนเฉพาะเมื่อพบ Net Profit > 0</i>"
+    )
+
+    return f"{header}\n\n{content}\n\n{footer}"
+
+
 def format_telegram_report(
-    session_name: str,
+    session_title: str,
     trade_date: str,
     profitable_opps: List[Dict[str, Any]],
     near_miss: Optional[Dict[str, Any]],
@@ -690,16 +819,10 @@ def format_telegram_report(
     calc_error_count: int,
     valid_minutes: int
 ) -> str:
-    """Formats actionable Thai arbitrage radar report for Telegram."""
-    time_window_map = {
-        "MIDDAY": ("09:45", "12:35", "พักเที่ยง"),
-        "EVENING": ("09:45", "17:05", "ปิดตลาดเย็น")
-    }
-    t_start, t_end, sess_label = time_window_map.get(session_name.upper(), ("09:45", "17:05", session_name))
-
+    """Formats full session summary report for Telegram (always delivered)."""
     header = (
         f"⚡ <b>TFEX INTRADAY ARBITRAGE RADAR</b>\n"
-        f"📅 <i>ข้อมูลวันที่ {trade_date} | รอบ {sess_label} ({t_start}–{t_end} น.)</i>\n"
+        f"📅 <i>ข้อมูลวันที่ {trade_date} | รอบ {session_title}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -784,63 +907,40 @@ def format_telegram_report(
     return f"{header}\n\n{content}\n\n{footer}"
 
 
-def escape_telegram_html(text: str) -> str:
-    """
-    Escapes raw <, >, and & characters for Telegram HTML parse_mode
-    while preserving supported Telegram tags (<b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>, <a>, </a>).
-    """
-    pattern = r"</?(?:b|i|code|pre|a)(?:\s+[^>]+)?>"
-    placeholder_map = {}
-
-    def repl_tag(m):
-        tok = f"___TAG_HOLD_{len(placeholder_map)}___"
-        placeholder_map[tok] = m.group(0)
-        return tok
-
-    tokenized = re.sub(pattern, repl_tag, text, flags=re.IGNORECASE)
-    tokenized = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", tokenized)
-    tokenized = tokenized.replace("<", "&lt;").replace(">", "&gt;")
-    for tok, orig in placeholder_map.items():
-        tokenized = tokenized.replace(tok, orig)
-
-    return tokenized
-
-
-def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool:
-    """Delivers HTML report to Telegram chat."""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    sanitized_html = escape_telegram_html(message_html)
-    payload = {
-        "chat_id": chat_id,
-        "text": sanitized_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=25)
-        print(f"[TELEGRAM] HTTP Status: {r.status_code}")
-        print(f"[TELEGRAM] API Response: {r.text}")
-        if r.status_code == 200 and r.json().get("ok"):
-            print("[TELEGRAM] Arbitrage radar summary delivered successfully.")
-            return True
-        else:
-            print(f"[TELEGRAM] Error: sendMessage failed with HTTP {r.status_code}: {r.text}")
-            return False
-    except Exception as e:
-        print(f"[TELEGRAM] Exception sending telegram notification: {e}")
-        return False
-
-
 # ==============================================================================
-# 6. MAIN CONTROLLER
+# 7. WORKER LOOP & DISPATCH CONTROLLER
 # ==============================================================================
 
-def run_arb_radar(session_name: str, target_date: Optional[str] = None, no_telegram: bool = False) -> None:
-    start_time = datetime.datetime.now(BANGKOK_TZ)
-    print("=" * 75)
-    print(f"TFEX INTRADAY ARBITRAGE RADAR | Session: {session_name.upper()}")
-    print(f"Timestamp: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("=" * 75)
+def get_next_pulse_time(now_dt: datetime.datetime, min_start: datetime.time) -> datetime.datetime:
+    """Computes next target pulse time at :00, :15, :30, :45 (+10 seconds offset)."""
+    # If now is before the minimum start time, target the minimum start time
+    min_start_dt = now_dt.replace(
+        hour=min_start.hour,
+        minute=min_start.minute,
+        second=min_start.second,
+        microsecond=0
+    )
+    if now_dt < min_start_dt:
+        return min_start_dt
+
+    for m in [0, 15, 30, 45]:
+        cand = now_dt.replace(minute=m, second=10, microsecond=0)
+        if cand > now_dt:
+            return cand
+    next_hr = now_dt + timedelta(hours=1)
+    return next_hr.replace(minute=0, second=10, microsecond=0)
+
+
+def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_telegram: bool = False) -> None:
+    """
+    Persistent Session Worker:
+    - Runs 15-minute pulses (:00, :15, :30, :45 +10s).
+    - Anti-Spam: Alerts only when profitable arb is detected.
+    - End of session: Dispatches comprehensive session summary report.
+    """
+    now_bkk = datetime.datetime.now(BANGKOK_TZ)
+    trade_date = target_date or now_bkk.strftime("%Y-%m-%d")
+    trade_date_obj = datetime.datetime.strptime(trade_date, "%Y-%m-%d").date()
 
     turso_url = os.environ.get("TURSO_DATABASE_URL")
     turso_token = os.environ.get("TURSO_AUTH_TOKEN")
@@ -853,71 +953,222 @@ def run_arb_radar(session_name: str, target_date: Optional[str] = None, no_teleg
 
     pipeline_url = f"{turso_url.replace('libsql://', 'https://').rstrip('/')}/v2/pipeline"
 
-    # Determine target trade date
-    now_bkk = datetime.datetime.now(BANGKOK_TZ)
-    trade_date = target_date or now_bkk.strftime("%Y-%m-%d")
-    try:
-        trade_date_obj = datetime.datetime.strptime(trade_date, "%Y-%m-%d").date()
-    except Exception as e:
-        print(f"[ERROR] Invalid date format for --date ({trade_date}): {e}")
+    # Concurrency Guard
+    if is_arb_worker_active(pipeline_url, turso_token, session_mode, now_bkk):
+        print(f"Another {session_mode} worker is already active. Exiting cleanly.")
+        sys.exit(0)
+
+    record_arb_heartbeat(pipeline_url, turso_token, session_mode, now_bkk)
+
+    # Session boundaries
+    if session_mode == "MORNING_WORKER":
+        first_pulse_time = time(10, 0, 10)
+        session_end_time = time(12, 35, 0)
+        summary_start_str = "09:45:00"
+        summary_end_str = "12:35:00"
+        summary_title = "สรุปภาพรวมช่วงเช้า (09:45–12:35 น.)"
+    else:  # AFTERNOON_WORKER
+        first_pulse_time = time(14, 30, 10)
+        session_end_time = time(17, 5, 0)
+        summary_start_str = "09:45:00"
+        summary_end_str = "17:05:00"
+        summary_title = "สรุปภาพรวมทั้งวัน (09:45–17:05 น.)"
+
+    # Contract & Rate Validation
+    cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
+    expiry_dt = parse_series_expiry(front_series, trade_date_obj)
+    dte = (expiry_dt.date() - trade_date_obj).days
+    if dte <= 0:
+        print(f"[ERROR] Invalid DTE ({dte} days) for series {front_series}. Exiting.")
+        sys.exit(1)
+    T_years = dte / 365.0
+    thor_rate = fetch_thor_rate(pipeline_url, turso_token)
+
+    print("=" * 75)
+    print(f"TFEX ARBITRAGE WORKER STARTED: {session_mode}")
+    print(f"Date: {trade_date} | Front: {front_series} (DTE: {dte}d) | THOR: {thor_rate*100.0:.2f}%")
+    print(f"First Pulse Target: {first_pulse_time.strftime('%H:%M:%S')} | End Time: {session_end_time.strftime('%H:%M:%S')}")
+    print("=" * 75)
+
+    # --------------------------------------------------------------------------
+    # 15-Minute Pulse Loop
+    # --------------------------------------------------------------------------
+    while True:
+        curr_bkk = datetime.datetime.now(BANGKOK_TZ)
+        if curr_bkk.time() >= session_end_time:
+            print(f"[WORKER] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Commencing session summary...")
+            break
+
+        next_pulse = get_next_pulse_time(curr_bkk, first_pulse_time)
+        if next_pulse.time() >= session_end_time:
+            # Sleep until session end time for final summary
+            target_end_dt = curr_bkk.replace(
+                hour=session_end_time.hour,
+                minute=session_end_time.minute,
+                second=session_end_time.second,
+                microsecond=0
+            )
+            sleep_sec = (target_end_dt - curr_bkk).total_seconds()
+            if sleep_sec > 0:
+                print(f"[WORKER] Standby for session end at {session_end_time.strftime('%H:%M:%S')} ({sleep_sec:.0f}s)...")
+                pytime.sleep(sleep_sec)
+            break
+
+        sleep_sec = (next_pulse - curr_bkk).total_seconds()
+        print(f"[WORKER] Next 15-min pulse at {next_pulse.strftime('%H:%M:%S')} (sleeping {sleep_sec:.0f}s)...")
+        if sleep_sec > 0:
+            pytime.sleep(sleep_sec)
+
+        # Pulse Execution
+        pulse_now = datetime.datetime.now(BANGKOK_TZ)
+        record_arb_heartbeat(pipeline_url, turso_token, session_mode, pulse_now)
+
+        w_start = (pulse_now - timedelta(minutes=15)).strftime("%H:%M:00")
+        w_end = pulse_now.strftime("%H:%M:00")
+        print(f"\n--- [15-MIN PULSE] Scanning window: {w_start} – {w_end} ---")
+
+        grouped_data, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
+            pipeline_url=pipeline_url,
+            auth_token=turso_token,
+            trade_date=trade_date,
+            start_time_bkk=w_start,
+            end_time_bkk=w_end
+        )
+
+        if not grouped_data:
+            print(f"[PULSE] No synchronized data found in window {w_start}–{w_end}. Skipping pulse.")
+            continue
+
+        p_opps, _, d1, e1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
+        v_opps, _, d2, e2 = scan_vertical_spreads(grouped_data, front_series)
+        c_opps, _, d3, e3 = scan_calendar_spreads(grouped_data, front_series, next_series)
+
+        pulse_opps = p_opps + v_opps + c_opps
+        tot_drop = d1 + d2 + d3
+        tot_err = e1 + e2 + e3
+
+        print(f"[PULSE] Found {len(pulse_opps)} profitable opportunities (Parity={len(p_opps)}, Vert={len(v_opps)}, Cal={len(c_opps)}).")
+
+        # Anti-Spam: Dispatch ONLY if profitable opportunities exist
+        if pulse_opps:
+            print(f"[TELEGRAM] Profitable opportunities detected! Dispatching 15-min alert...")
+            pulse_msg = format_15min_pulse_alert(
+                trade_date=trade_date,
+                window_start=w_start[:5],
+                window_end=w_end[:5],
+                profitable_opps=pulse_opps,
+                thor_rate=thor_rate,
+                dte=dte,
+                T_years=T_years,
+                dropped_invalid_quotes=tot_drop,
+                calc_error_count=tot_err,
+                valid_minutes=len(grouped_data)
+            )
+            if not no_telegram and tg_token and tg_chat_id:
+                send_telegram_alert(tg_token, tg_chat_id, pulse_msg)
+        else:
+            print(f"[PULSE] ({w_start}–{w_end}) No profitable opportunities. Anti-spam: Telegram alert skipped.")
+
+    # --------------------------------------------------------------------------
+    # Final Session Summary Execution
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 75)
+    print(f"GENERATING FINAL SESSION SUMMARY: {summary_title}")
+    print("=" * 75)
+
+    grouped_data, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        trade_date=trade_date,
+        start_time_bkk=summary_start_str,
+        end_time_bkk=summary_end_str
+    )
+
+    if fut_cnt == 0 or opt_cnt == 0 or len(grouped_data) == 0:
+        abort_msg = (
+            f"⚠️ <b>[ABORT] ไม่พบข้อมูล Intraday ใน Turso สำหรับวันที่ {trade_date} ({summary_title}) — งดการคำนวณ</b>\n\n"
+            f"• <b>ตาราง Futures:</b> {fut_cnt} แถว\n"
+            f"• <b>ตาราง Options:</b> {opt_cnt} แถว\n"
+            f"• <b>ช่วงเวลาที่ค้นหา:</b> {summary_start_str} ถึง {summary_end_str} น."
+        )
+        print(f"[ABORT] Zero records for session summary.")
+        if not no_telegram and tg_token and tg_chat_id:
+            send_telegram_alert(tg_token, tg_chat_id, abort_msg)
         sys.exit(1)
 
-    # Time boundaries
+    p_opps, near_p, d1, e1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
+    v_opps, near_v, d2, e2 = scan_vertical_spreads(grouped_data, front_series)
+    c_opps, near_c, d3, e3 = scan_calendar_spreads(grouped_data, front_series, next_series)
+
+    all_opps = p_opps + v_opps + c_opps
+    all_nears = [n for n in [near_p, near_v, near_c] if n is not None]
+    best_near = max(all_nears, key=lambda x: x["net_pts"]) if all_nears else None
+
+    summary_msg = format_telegram_report(
+        session_title=summary_title,
+        trade_date=trade_date,
+        profitable_opps=all_opps,
+        near_miss=best_near,
+        thor_rate=thor_rate,
+        dte=dte,
+        T_years=T_years,
+        dropped_invalid_quotes=(d1 + d2 + d3),
+        calc_error_count=(e1 + e2 + e3),
+        valid_minutes=len(grouped_data)
+    )
+
+    print("\n" + "=" * 75)
+    print("SESSION SUMMARY NOTIFICATION:")
+    print("=" * 75)
+    print(summary_msg)
+    print("=" * 75)
+
+    if not no_telegram and tg_token and tg_chat_id:
+        send_telegram_alert(tg_token, tg_chat_id, summary_msg)
+    else:
+        print("[TELEGRAM] --no-telegram supplied or credentials missing. Summary dispatch skipped.")
+
+    print(f"=== {session_mode} WORKER COMPLETED SUCCESSFULLY ===")
+    sys.exit(0)
+
+
+def run_single_scan(session_name: str, target_date: Optional[str] = None, no_telegram: bool = False) -> None:
+    """Single-shot scan for MIDDAY (09:45-12:35) or EVENING (09:45-17:05)."""
+    now_bkk = datetime.datetime.now(BANGKOK_TZ)
+    trade_date = target_date or now_bkk.strftime("%Y-%m-%d")
+    trade_date_obj = datetime.datetime.strptime(trade_date, "%Y-%m-%d").date()
+
+    turso_url = os.environ.get("TURSO_DATABASE_URL")
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN")
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not turso_url or not turso_token:
+        print("[ERROR] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not configured in environment.")
+        sys.exit(1)
+
+    pipeline_url = f"{turso_url.replace('libsql://', 'https://').rstrip('/')}/v2/pipeline"
+
     sess_upper = session_name.upper()
     if sess_upper == "MIDDAY":
         t_start_bkk = "09:45:00"
         t_end_bkk = "12:35:00"
-        sess_label = "พักเที่ยง (09:45–12:35 น.)"
-    else:  # EVENING
+        sess_title = "พักเที่ยง (09:45–12:35 น.)"
+    else:
         t_start_bkk = "09:45:00"
         t_end_bkk = "17:05:00"
-        sess_label = "ปิดตลาดเย็น (09:45–17:05 น.)"
+        sess_title = "ปิดตลาดเย็น (09:45–17:05 น.)"
 
-    # 1. Strict Contract Discovery & Expiration / DTE
     cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
-    try:
-        expiry_dt = parse_series_expiry(front_series, trade_date_obj)
-        dte = (expiry_dt.date() - trade_date_obj).days
-    except Exception as e:
-        err_msg = f"❌ <b>[ERROR] คำนวณวันหมดอายุซีรีส์ {front_series} ผิดพลาด: {e} — ยกเลิกการสแกน</b>"
-        print(f"[ERROR] parse_series_expiry error: {e}")
-        if tg_token and tg_chat_id and not no_telegram:
-            send_telegram_alert(tg_token, tg_chat_id, err_msg)
-        sys.exit(1)
-
+    expiry_dt = parse_series_expiry(front_series, trade_date_obj)
+    dte = (expiry_dt.date() - trade_date_obj).days
     if dte <= 0:
-        err_msg = (
-            f"❌ <b>[ERROR] คำนวณวันหมดอายุซีรีส์ {front_series} ผิดพลาด (DTE = {dte} วัน) — ยกเลิกการสแกน</b>\n\n"
-            f"• <b>วันหมดอายุ:</b> <code>{expiry_dt.strftime('%Y-%m-%d')}</code>\n"
-            f"• <b>วันที่สแกน:</b> <code>{trade_date}</code>"
-        )
-        print(f"[ERROR] Strict Validation: DTE <= 0 ({dte} days) for series {front_series}. Exiting.")
-        if tg_token and tg_chat_id and not no_telegram:
-            send_telegram_alert(tg_token, tg_chat_id, err_msg)
+        print(f"[ERROR] Invalid DTE ({dte} days) for series {front_series}. Exiting.")
         sys.exit(1)
-
     T_years = dte / 365.0
-    print(f"[RADAR] Active Series: Front={front_series}, Next={next_series} | Expiry: {expiry_dt.strftime('%Y-%m-%d')} (DTE: {dte} days, T: {T_years:.4f}y)")
+    thor_rate = fetch_thor_rate(pipeline_url, turso_token)
 
-    # 2. Strict THOR Rate Retrieval (No Default)
-    print("[DATA] Fetching latest official THOR interest rate from eod_thor_rates...")
-    try:
-        thor_rate = fetch_thor_rate(pipeline_url, turso_token)
-        print(f"[DATA] Official THOR rate loaded: {thor_rate*100.0:.2f}%")
-    except Exception as e:
-        thor_err_msg = (
-            "❌ <b>[ERROR] ไม่พบข้อมูลอัตราดอกเบี้ย THOR ในฐานข้อมูล — ยกเลิกการสแกน</b>\n\n"
-            f"• <b>รายละเอียด:</b> {e}\n"
-            "• <b>คำแนะนำ:</b> ตรวจสอบการอัปเดตข้อมูลของ tfex-eod-collector"
-        )
-        print(f"[ERROR] Strict Validation Failed: {e}")
-        if tg_token and tg_chat_id and not no_telegram:
-            send_telegram_alert(tg_token, tg_chat_id, thor_err_msg)
-        sys.exit(1)
-
-    # 3. Fetch Intraday Dataset from Turso (No Synthetic Fallback)
-    print(f"[DATA] Fetching intraday dataset for {trade_date} ({t_start_bkk} - {t_end_bkk})...")
-    grouped_data, fut_row_count, opt_row_count = fetch_intraday_arb_dataset(
+    grouped_data, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
         pipeline_url=pipeline_url,
         auth_token=turso_token,
         trade_date=trade_date,
@@ -925,80 +1176,51 @@ def run_arb_radar(session_name: str, target_date: Optional[str] = None, no_teleg
         end_time_bkk=t_end_bkk
     )
 
-    print(f"[DATA] Rows loaded from Turso: Futures={fut_row_count:,}, Options={opt_row_count:,}, Synchronized Minutes={len(grouped_data)}")
-
-    # 4. Strict 0-Row Check: Fail Loud & Alert Telegram
-    if fut_row_count == 0 or opt_row_count == 0 or len(grouped_data) == 0:
+    if fut_cnt == 0 or opt_cnt == 0 or len(grouped_data) == 0:
         abort_msg = (
-            f"⚠️ <b>[ABORT] ไม่พบข้อมูล Intraday ใน Turso สำหรับวันที่ {trade_date} (รอบ {sess_label}) — งดการคำนวณ</b>\n\n"
-            f"• <b>ตาราง Futures:</b> {fut_row_count} แถว\n"
-            f"• <b>ตาราง Options:</b> {opt_row_count} แถว\n"
-            f"• <b>ช่วงเวลาที่ค้นหา:</b> {t_start_bkk} ถึง {t_end_bkk} น.\n"
-            f"• <b>คำแนะนำ:</b> ตรวจสอบสถานะการรันของ tfex-intraday-collector หรือตรวจเช็กวันหยุดทำการ TFEX"
+            f"⚠️ <b>[ABORT] ไม่พบข้อมูล Intraday ใน Turso สำหรับวันที่ {trade_date} ({sess_title}) — งดการคำนวณ</b>\n\n"
+            f"• <b>ตาราง Futures:</b> {fut_cnt} แถว\n"
+            f"• <b>ตาราง Options:</b> {opt_cnt} แถว\n"
+            f"• <b>ช่วงเวลาที่ค้นหา:</b> {t_start_bkk} ถึง {t_end_bkk} น."
         )
-        print(f"[ABORT] ไม่พบข้อมูล Intraday ใน Turso สำหรับวันที่ {trade_date} (รอบ {sess_label}) — งดการคำนวณ")
-        if tg_token and tg_chat_id and not no_telegram:
+        print(f"[ABORT] Zero records for session {sess_title}.")
+        if not no_telegram and tg_token and tg_chat_id:
             send_telegram_alert(tg_token, tg_chat_id, abort_msg)
         sys.exit(1)
 
-    # 5. Execute Arbitrage Scanners
-    print("[SCAN] 1. Scanning Put-Call Parity (Black-76: Conversion & Reversal)...")
-    parity_opps, near_parity, drop1, err1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
-    print(f"       Found {len(parity_opps)} profitable Parity opportunities (Dropped: {drop1:,}, Calc Errors: {err1}).")
+    p_opps, near_p, d1, e1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
+    v_opps, near_v, d2, e2 = scan_vertical_spreads(grouped_data, front_series)
+    c_opps, near_c, d3, e3 = scan_calendar_spreads(grouped_data, front_series, next_series)
 
-    print("[SCAN] 2. Scanning Vertical Spread Monotonicity Violations...")
-    vert_opps, near_vert, drop2, err2 = scan_vertical_spreads(grouped_data, front_series)
-    print(f"       Found {len(vert_opps)} profitable Vertical opportunities (Dropped: {drop2:,}, Calc Errors: {err2}).")
-
-    print("[SCAN] 3. Scanning Calendar Spread Spikes (Front vs Next Quarter)...")
-    cal_opps, near_cal, drop3, err3 = scan_calendar_spreads(grouped_data, front_series, next_series)
-    print(f"       Found {len(cal_opps)} profitable Calendar opportunities (Dropped: {drop3:,}, Calc Errors: {err3}).")
-
-    all_opps = parity_opps + vert_opps + cal_opps
-    all_nears = [n for n in [near_parity, near_vert, near_cal] if n is not None]
+    all_opps = p_opps + v_opps + c_opps
+    all_nears = [n for n in [near_p, near_v, near_c] if n is not None]
     best_near = max(all_nears, key=lambda x: x["net_pts"]) if all_nears else None
 
-    total_dropped = drop1 + drop2 + drop3
-    total_calc_errors = err1 + err2 + err3
-
-    # 6. Build Telegram Report
-    telegram_msg = format_telegram_report(
-        session_name=session_name,
+    report_msg = format_telegram_report(
+        session_title=sess_title,
         trade_date=trade_date,
         profitable_opps=all_opps,
         near_miss=best_near,
         thor_rate=thor_rate,
         dte=dte,
         T_years=T_years,
-        dropped_invalid_quotes=total_dropped,
-        calc_error_count=total_calc_errors,
+        dropped_invalid_quotes=(d1 + d2 + d3),
+        calc_error_count=(e1 + e2 + e3),
         valid_minutes=len(grouped_data)
     )
 
     print("\n" + "=" * 75)
-    print("TELEGRAM NOTIFICATION PREVIEW:")
+    print("SESSION REPORT NOTIFICATION:")
     print("=" * 75)
-    print(telegram_msg)
+    print(report_msg)
     print("=" * 75)
-    print(f"Message Length: {len(telegram_msg)} characters (Limit: 4096)")
 
-    # 7. Dispatch to Telegram
-    if no_telegram:
-        print("[TELEGRAM] --no-telegram supplied. Dispatch skipped.")
-    elif tg_token and tg_chat_id:
-        print(f"[TELEGRAM] Dispatching alert to Chat ID {tg_chat_id}...")
-        success = send_telegram_alert(tg_token, tg_chat_id, telegram_msg)
-        if not success:
-            print("[TELEGRAM] CRITICAL: Failed to deliver Telegram notification. Exiting with status 1.")
-            sys.exit(1)
+    if not no_telegram and tg_token and tg_chat_id:
+        send_telegram_alert(tg_token, tg_chat_id, report_msg)
     else:
-        print("[TELEGRAM] CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing from environment. Exiting with status 1.")
-        sys.exit(1)
+        print("[TELEGRAM] --no-telegram supplied or credentials missing. Dispatch skipped.")
 
-    duration = (datetime.datetime.now(BANGKOK_TZ) - start_time).total_seconds()
-    print("=" * 75)
-    print(f"ARBITRAGE RADAR COMPLETED SUCCESSFULLY ({duration:.2f}s)")
-    print("=" * 75)
+    sys.exit(0)
 
 
 # ==============================================================================
@@ -1007,9 +1229,17 @@ def run_arb_radar(session_name: str, target_date: Optional[str] = None, no_teleg
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TFEX Intraday Arbitrage Radar")
-    parser.add_argument("--session", choices=["MIDDAY", "EVENING"], default="EVENING", help="Trading session to scan (MIDDAY or EVENING)")
+    parser.add_argument(
+        "--session",
+        choices=["MORNING_WORKER", "AFTERNOON_WORKER", "MIDDAY", "EVENING"],
+        default="MORNING_WORKER",
+        help="Execution session mode"
+    )
     parser.add_argument("--date", type=str, default=None, help="Target trade date (YYYY-MM-DD, default today)")
     parser.add_argument("--no-telegram", action="store_true", help="Skip sending Telegram alert")
     args = parser.parse_args()
 
-    run_arb_radar(session_name=args.session, target_date=args.date, no_telegram=args.no_telegram)
+    if args.session in ["MORNING_WORKER", "AFTERNOON_WORKER"]:
+        run_arb_worker(session_mode=args.session, target_date=args.date, no_telegram=args.no_telegram)
+    else:
+        run_single_scan(session_name=args.session, target_date=args.date, no_telegram=args.no_telegram)
