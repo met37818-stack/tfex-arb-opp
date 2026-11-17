@@ -3,13 +3,17 @@ TFEX Intraday Arbitrage Radar (arb_scanner.py)
 ==============================================
 Scans high-frequency intraday snapshots from Turso Cloud SQLite to discover
 real executable arbitrage opportunities across:
-1. Put-Call Parity (Conversion & Reversal)
+1. Put-Call Parity (Black-76 Futures Options: Conversion & Reversal)
 2. Vertical Spread Monotonicity Violations (Call & Put)
 3. Calendar Spread Spikes (Front vs Next Quarter Futures)
 
-Strict Execution Rules:
-- Buy at Ask, Sell at Bid. Filter out bid <= 0, ask <= 0, ask < bid.
-- Executable sets (max_sets) = min(volume of all legs in the same exact minute).
+Strict Fail-Loud / No Silent Fallback Rules:
+- Real Turso Data Only: Never generate synthetic/mock quotes.
+- Abort on 0 Rows: If Turso has 0 futures or options rows, send Telegram abort alert and exit.
+- Strict THOR Rate: Must exist in eod_thor_rates; fail loud if missing/NULL/<=0.
+- Strict DTE / T_years: Must calculate from actual series expiry; fail loud if DTE <= 0.
+- Strict Bid/Ask: Never use 'last' in place of bid/ask. Drop any row with bid<=0, ask<=0,
+  vol<=0, or ask<bid, and report dropped_invalid_quotes count.
 - Commission Hurdle:
   - 2-leg strategies (Vertical / Calendar): 0.40 pts (40 THB/leg round-turn = 80 THB).
   - 3-leg strategies (Conversion / Reversal): 0.60 pts (120 THB).
@@ -32,36 +36,26 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+load_dotenv()
+
 BANGKOK_TZ = pytz.timezone("Asia/Bangkok")
 CONTRACT_MULTIPLIER = 200.0  # THB per SET50 index point
-COMMISSION_PER_LEG_PTS = 0.20  # 40 THB / 200 = 0.20 index pts per leg round-turn
+COMMISSION_2LEG_PTS = 0.40   # 2 legs * 0.20 index pts
+COMMISSION_3LEG_PTS = 0.60   # 3 legs * 0.20 index pts
 
 MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
 REVERSE_MONTH_CODES = {"H": 3, "M": 6, "U": 9, "Z": 12}
 
+
 # ==============================================================================
-# 1. DATABASE & CONFIGURATION UTILITIES
+# 1. TURSO HTTP PIPELINE CLIENT
 # ==============================================================================
 
-def load_environment() -> None:
-    """Loads environment variables from local and parent directories."""
-    candidates = [
-        ".env",
-        "../.env",
-        "../tfex-intraday-collector/.env",
-        "../tfex-eod-collector/.env",
-        "../tfex-quant-analytics/.env"
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            load_dotenv(c)
-
-
-def to_turso_arg(val: Any) -> dict:
+def to_turso_arg(val: Any) -> Dict[str, Any]:
     if val is None:
         return {"type": "null"}
     if isinstance(val, bool):
-        return {"type": "integer", "value": "1" if val else "0"}
+        return {"type": "integer", "value": str(int(val))}
     if isinstance(val, int):
         return {"type": "integer", "value": str(val)}
     if isinstance(val, float):
@@ -71,66 +65,67 @@ def to_turso_arg(val: Any) -> dict:
     return {"type": "text", "value": str(val)}
 
 
+def parse_turso_result_rows(res: Dict[str, Any]) -> List[List[Any]]:
+    cols = [c["name"] for c in res.get("cols", [])]
+    rows = []
+    for raw_row in res.get("rows", []):
+        row_vals = []
+        for cell in raw_row:
+            v_type = cell.get("type")
+            if v_type == "null":
+                row_vals.append(None)
+            elif v_type == "integer":
+                row_vals.append(int(cell.get("value", 0)))
+            elif v_type == "float":
+                row_vals.append(float(cell.get("value", 0.0)))
+            else:
+                row_vals.append(cell.get("value"))
+        rows.append(row_vals)
+    return rows
+
+
 def execute_turso_sql(
     pipeline_url: str,
     auth_token: str,
     sql: str,
-    args: list = None
+    args: Optional[List[Any]] = None
 ) -> Tuple[List[str], List[List[Any]]]:
-    """Executes a single SQL query against Turso Cloud SQLite HTTP Pipeline API."""
+    """Executes SQL via Turso v2 pipeline."""
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
     }
-    turso_args = [to_turso_arg(a) for a in (args or [])]
+    stmt = {"sql": sql.strip()}
+    if args:
+        stmt["args"] = [to_turso_arg(a) for a in args]
     payload = {
         "requests": [
-            {
-                "type": "execute",
-                "stmt": {
-                    "sql": sql.strip(),
-                    "args": turso_args
-                }
-            },
+            {"type": "execute", "stmt": stmt},
             {"type": "close"}
         ]
     }
-    resp = requests.post(pipeline_url, headers=headers, json=payload, timeout=25)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Turso query failed (HTTP {resp.status_code}): {resp.text}")
-    data = resp.json()
-    result_item = data.get("results", [])[0]
-    if result_item.get("type") == "error":
-        raise RuntimeError(f"Turso SQL execution error: {result_item.get('error')}")
-
-    r = result_item.get("response", {}).get("result", {})
-    cols = [c["name"] for c in r.get("cols", [])]
-    rows = []
-    for raw_row in r.get("rows", []):
-        parsed = []
-        for val_dict in raw_row:
-            v_type = val_dict.get("type")
-            v = val_dict.get("value")
-            if v_type == "null" or v is None:
-                parsed.append(None)
-            elif v_type == "integer":
-                parsed.append(int(v))
-            elif v_type == "float":
-                parsed.append(float(v))
-            else:
-                parsed.append(str(v))
-        rows.append(parsed)
-    return cols, rows
+    r = requests.post(pipeline_url, json=payload, headers=headers, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"Turso API HTTP error ({r.status_code}): {r.text}")
+    data = r.json()
+    for resp_item in data.get("results", []):
+        if resp_item.get("type") == "error":
+            raise RuntimeError(f"Turso SQL execution error: {resp_item.get('error')}")
+        if resp_item.get("type") == "ok":
+            res = resp_item["response"]["result"]
+            cols = [c["name"] for c in res.get("cols", [])]
+            rows = parse_turso_result_rows(res)
+            return cols, rows
+    return [], []
 
 
 # ==============================================================================
-# 2. CONTRACT SPECIFICATIONS & EXPIRY DISCOVERY
+# 2. DYNAMIC SERIES & EXPIRATION CALCULATION
 # ==============================================================================
 
 def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
     """
-    Calculates TFEX contract last trading day:
-    The business day immediately preceding the last business day of the contract month.
+    Business day immediately preceding the last business day of the contract month.
     Trading ceases at 16:30 hrs.
     """
     _, last_day = calendar.monthrange(year, month)
@@ -147,26 +142,28 @@ def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
 
 
 def resolve_active_series_candidates(now_bkk: datetime.datetime) -> Tuple[List[str], str, str]:
-    """Discovers active quarterly series (e.g. ['Z26', 'H27'], 'Z26', 'H27')."""
-    active_quarterlies: List[str] = []
-    for yr in range(now_bkk.year, now_bkk.year + 3):
-        for qm in [3, 6, 9, 12]:
-            q_ltd = get_contract_last_trading_day(yr, qm)
-            if now_bkk <= q_ltd:
-                code = MONTH_CODES[qm]
-                yr_short = str(yr)[-2:]
-                active_quarterlies.append(f"{code}{yr_short}")
+    """Resolves active quarterly series without hardcoding."""
+    curr_year = now_bkk.year
+    candidates = []
+    for y in [curr_year, curr_year + 1]:
+        for m in [3, 6, 9, 12]:
+            ltd = get_contract_last_trading_day(y, m)
+            if ltd > now_bkk:
+                candidates.append((ltd, f"{MONTH_CODES[m]}{str(y)[-2:]}"))
 
-    candidate_futures_series = active_quarterlies[:4]
-    front_series = active_quarterlies[0]
-    next_series = active_quarterlies[1]
-    return candidate_futures_series, front_series, next_series
+    candidates.sort(key=lambda x: x[0])
+    series_list = [c[1] for c in candidates[:4]]
+    front_series = series_list[0] if series_list else "Z26"
+    next_series = series_list[1] if len(series_list) > 1 else "H27"
+    return series_list, front_series, next_series
 
 
-def parse_series_expiry(series_code: str, ref_date: datetime.date) -> datetime.datetime:
-    """Parses series code like Z26 or H27 into expiry datetime."""
-    month_code = series_code[0].upper()
-    month = REVERSE_MONTH_CODES.get(month_code, 12)
+def parse_series_expiry(series_code: str, ref_date: date) -> datetime.datetime:
+    """Parses series code e.g. 'Z26' -> last trading datetime."""
+    month_char = series_code[0].upper()
+    month = REVERSE_MONTH_CODES.get(month_char)
+    if not month:
+        raise ValueError(f"Invalid series month character: '{month_char}'")
     year_prefix = ref_date.year // 100
     year_suffix = int(series_code[1:])
     year = year_prefix * 100 + year_suffix
@@ -174,8 +171,27 @@ def parse_series_expiry(series_code: str, ref_date: datetime.date) -> datetime.d
 
 
 # ==============================================================================
-# 3. TURSO INTRADAY DATASET LOADER
+# 3. TURSO INTRADAY DATASET LOADER (STRICT VALIDATION)
 # ==============================================================================
+
+def fetch_thor_rate(pipeline_url: str, auth_token: str) -> float:
+    """
+    Fetches the latest official BOT THOR interest rate from eod_thor_rates.
+    Strict validation: Raises ValueError if missing, NULL, or rate <= 0.
+    """
+    sql_thor = "SELECT thor_rate FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"
+    _, rows_thor = execute_turso_sql(pipeline_url, auth_token, sql_thor)
+    if not rows_thor or rows_thor[0][0] is None:
+        raise ValueError("No record found in eod_thor_rates table or value is NULL.")
+    
+    val = float(rows_thor[0][0])
+    if val <= 0:
+        raise ValueError(f"Invalid THOR rate in eod_thor_rates: {val} (must be > 0)")
+    
+    # If percentage e.g. 2.25, convert to decimal 0.0225
+    rate = val / 100.0 if val > 0.5 else val
+    return rate
+
 
 def fetch_intraday_arb_dataset(
     pipeline_url: str,
@@ -183,28 +199,19 @@ def fetch_intraday_arb_dataset(
     trade_date: str,
     start_time_bkk: str,
     end_time_bkk: str
-) -> Tuple[Dict[str, Dict[str, Any]], float]:
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     """
-    Fetches synchronized 1-minute intraday snapshots for Spot, Futures, Options
-    and the latest BOT THOR interest rate.
+    Fetches synchronized 1-minute intraday snapshots for Spot, Futures, Options.
+    Strict Bid/Ask: Drops invalid quotes (bid<=0, ask<=0, vol<=0, ask<bid).
     Returns:
     - grouped_data: {timestamp_str: {"spot": ..., "futures": {...}, "options": {...}}}
-    - thor_rate: float (annual interest rate e.g. 0.0225)
+    - total_rows_fut: int
+    - total_rows_opt: int
     """
     ts_start = f"{trade_date} {start_time_bkk}"
     ts_end = f"{trade_date} {end_time_bkk}"
 
-    # 1. Fetch Latest THOR interest rate
-    thor_rate = 0.0225  # Standard default 2.25%
-    try:
-        sql_thor = "SELECT thor_rate FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"
-        _, rows_thor = execute_turso_sql(pipeline_url, auth_token, sql_thor)
-        if rows_thor and rows_thor[0][0] is not None:
-            thor_rate = float(rows_thor[0][0]) / 100.0 if float(rows_thor[0][0]) > 0.5 else float(rows_thor[0][0])
-    except Exception as e:
-        print(f"[DATA] Note: Using fallback THOR rate ({thor_rate*100:.2f}%): {e}")
-
-    # 2. Fetch Spot Snapshots
+    # 1. Fetch Spot Snapshots
     sql_spot = """
     SELECT captured_at_bkk, last, volume, value 
     FROM spot_snapshots 
@@ -213,7 +220,7 @@ def fetch_intraday_arb_dataset(
     """
     _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [ts_start, ts_end])
 
-    # 3. Fetch Futures Snapshots
+    # 2. Fetch Futures Snapshots
     sql_fut = """
     SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest 
     FROM futures_snapshots 
@@ -222,7 +229,7 @@ def fetch_intraday_arb_dataset(
     """
     _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [ts_start, ts_end])
 
-    # 4. Fetch Options Snapshots
+    # 3. Fetch Options Snapshots
     sql_opt = """
     SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest 
     FROM options_snapshots 
@@ -271,11 +278,11 @@ def fetch_intraday_arb_dataset(
             "oi": float(oi) if oi is not None else 0.0
         }
 
-    return grouped, thor_rate
+    return grouped, len(rows_fut), len(rows_opt)
 
 
 # ==============================================================================
-# 4. THREE INTRADAY ARBITRAGE SCAN MODULES
+# 4. THREE INTRADAY ARBITRAGE SCAN MODULES (STRICT VALIDATION)
 # ==============================================================================
 
 def scan_put_call_parity(
@@ -283,21 +290,22 @@ def scan_put_call_parity(
     front_series: str,
     thor_rate: float,
     T_years: float
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
     """
-    Module 1: Put-Call Parity Arbitrage (Conversion & Reversal).
+    Module 1: Put-Call Parity Arbitrage (Black-76 Futures Options).
     Commission Hurdle: 0.60 index points (3 legs * 0.20 pts).
-    - Conversion: Sell Call (Bid), Buy Put (Ask), Buy Futures (Ask).
-      Gross = Call_Bid - Put_Ask + K*exp(-r*T) - Fut_Ask
-    - Reversal: Buy Call (Ask), Sell Put (Bid), Sell Futures (Bid).
-      Gross = Put_Bid - Call_Ask + Fut_Bid - K*exp(-r*T)
+    Formula: discounted_diff = (F - K) * exp(-r * T)
+    - Conversion: gross_profit = (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
+    - Reversal:   gross_profit = (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
     """
-    COMMISSION = 0.60
+    COMMISSION = COMMISSION_3LEG_PTS
     fut_sym = f"S50{front_series}"
-    disc_factor = math.exp(-thor_rate * max(0.001, T_years))
+    disc_factor = math.exp(-thor_rate * T_years)
 
     opportunities: List[Dict[str, Any]] = []
     best_near_miss: Optional[Dict[str, Any]] = None
+    dropped_invalid_quotes = 0
+    calc_error_count = 0
 
     for ts in sorted(grouped_data.keys()):
         frame = grouped_data[ts]
@@ -309,7 +317,11 @@ def scan_put_call_parity(
         f_bid = fut.get("bid")
         f_ask = fut.get("ask")
         f_vol = fut.get("volume", 0.0)
-        if f_bid is None or f_ask is None or f_bid <= 0 or f_ask <= 0 or f_ask < f_bid:
+
+        # Strict bid/ask/vol validation: Never use last price
+        if (f_bid is None or f_ask is None or f_bid <= 0 or f_ask <= 0 or
+            f_vol <= 0 or f_ask < f_bid):
+            dropped_invalid_quotes += 1
             continue
 
         ref_price = spot_ref or ((f_bid + f_ask) / 2.0)
@@ -330,78 +342,104 @@ def scan_put_call_parity(
             p_bid, p_ask = p_quote.get("bid"), p_quote.get("ask")
             c_vol, p_vol = c_quote.get("volume", 0.0), p_quote.get("volume", 0.0)
 
-            # Strict bid/ask validity
-            if (c_bid is None or c_ask is None or c_bid <= 0 or c_ask <= 0 or c_ask < c_bid or
-                p_bid is None or p_ask is None or p_bid <= 0 or p_ask <= 0 or p_ask < p_bid):
+            # Strict bid/ask/vol validation: Never use last price
+            if (c_bid is None or c_ask is None or c_bid <= 0 or c_ask <= 0 or
+                c_vol <= 0 or c_ask < c_bid):
+                dropped_invalid_quotes += 1
+                continue
+            if (p_bid is None or p_ask is None or p_bid <= 0 or p_ask <= 0 or
+                p_vol <= 0 or p_ask < p_bid):
+                dropped_invalid_quotes += 1
                 continue
 
             max_sets = int(min(c_vol, p_vol, f_vol))
-            pv_k = k * disc_factor
             liq_tag = "[Liquid: Spot±30]" if abs(k - ref_price) <= 30.0 else "[Deep Strike: ถือจนหมดอายุ]"
 
+            # ------------------------------------------------------------------
             # Strategy 1: Conversion
             # Sell Call @ c_bid, Buy Put @ p_ask, Buy Futures @ f_ask
-            gross_conv = (c_bid - p_ask) + (pv_k - f_ask)
-            net_conv = gross_conv - COMMISSION
+            # gross_profit = (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
+            # ------------------------------------------------------------------
+            try:
+                disc_diff_conv = (f_ask - k) * disc_factor
+                gross_conv = (c_bid - p_ask) - disc_diff_conv
+                if math.isnan(gross_conv) or math.isinf(gross_conv):
+                    calc_error_count += 1
+                    gross_conv = None
+            except Exception:
+                calc_error_count += 1
+                gross_conv = None
 
-            item_conv = {
-                "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
-                "target": f"Strike {k:.0f} & {fut_sym}",
-                "tag": liq_tag,
-                "time": ts,
-                "strike": k,
-                "gross_pts": gross_conv,
-                "net_pts": net_conv,
-                "commission_pts": COMMISSION,
-                "max_sets": max_sets,
-                "legs": [
-                    f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Vol: {c_vol:,.0f})",
-                    f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Vol: {p_vol:,.0f})",
-                    f"Buy Futures {fut_sym} @ Ask <code>{f_ask:.2f}</code> (Vol: {f_vol:,.0f})"
-                ]
-            }
+            if gross_conv is not None:
+                net_conv = gross_conv - COMMISSION
+                item_conv = {
+                    "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
+                    "target": f"Strike {k:.0f} & {fut_sym}",
+                    "tag": liq_tag,
+                    "time": ts,
+                    "strike": k,
+                    "gross_pts": gross_conv,
+                    "net_pts": net_conv,
+                    "commission_pts": COMMISSION,
+                    "max_sets": max_sets,
+                    "legs": [
+                        f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Vol: {c_vol:,.0f})",
+                        f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Vol: {p_vol:,.0f})",
+                        f"Buy Futures {fut_sym} @ Ask <code>{f_ask:.2f}</code> (Vol: {f_vol:,.0f})"
+                    ]
+                }
+                if net_conv > 0:
+                    opportunities.append(item_conv)
+                else:
+                    if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
+                        best_near_miss = item_conv
 
-            if net_conv > 0:
-                opportunities.append(item_conv)
-            else:
-                if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
-                    best_near_miss = item_conv
-
+            # ------------------------------------------------------------------
             # Strategy 2: Reversal
             # Buy Call @ c_ask, Sell Put @ p_bid, Sell Futures @ f_bid
-            gross_rev = (p_bid - c_ask) + (f_bid - pv_k)
-            net_rev = gross_rev - COMMISSION
+            # gross_profit = (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
+            # ------------------------------------------------------------------
+            try:
+                disc_diff_rev = (f_bid - k) * disc_factor
+                gross_rev = disc_diff_rev - (c_ask - p_bid)
+                if math.isnan(gross_rev) or math.isinf(gross_rev):
+                    calc_error_count += 1
+                    gross_rev = None
+            except Exception:
+                calc_error_count += 1
+                gross_rev = None
 
-            item_rev = {
-                "strategy": "Reversal (Buy C, Sell P, Sell Fut)",
-                "target": f"Strike {k:.0f} & {fut_sym}",
-                "tag": liq_tag,
-                "time": ts,
-                "strike": k,
-                "gross_pts": gross_rev,
-                "net_pts": net_rev,
-                "commission_pts": COMMISSION,
-                "max_sets": max_sets,
-                "legs": [
-                    f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Vol: {c_vol:,.0f})",
-                    f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Vol: {p_vol:,.0f})",
-                    f"Sell Futures {fut_sym} @ Bid <code>{f_bid:.2f}</code> (Vol: {f_vol:,.0f})"
-                ]
-            }
+            if gross_rev is not None:
+                net_rev = gross_rev - COMMISSION
+                item_rev = {
+                    "strategy": "Reversal (Buy C, Sell P, Sell Fut)",
+                    "target": f"Strike {k:.0f} & {fut_sym}",
+                    "tag": liq_tag,
+                    "time": ts,
+                    "strike": k,
+                    "gross_pts": gross_rev,
+                    "net_pts": net_rev,
+                    "commission_pts": COMMISSION,
+                    "max_sets": max_sets,
+                    "legs": [
+                        f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Vol: {c_vol:,.0f})",
+                        f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Vol: {p_vol:,.0f})",
+                        f"Sell Futures {fut_sym} @ Bid <code>{f_bid:.2f}</code> (Vol: {f_vol:,.0f})"
+                    ]
+                }
+                if net_rev > 0:
+                    opportunities.append(item_rev)
+                else:
+                    if best_near_miss is None or net_rev > best_near_miss["net_pts"]:
+                        best_near_miss = item_rev
 
-            if net_rev > 0:
-                opportunities.append(item_rev)
-            else:
-                if best_near_miss is None or net_rev > best_near_miss["net_pts"]:
-                    best_near_miss = item_rev
-
-    return opportunities, best_near_miss
+    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count
 
 
 def scan_vertical_spreads(
     grouped_data: Dict[str, Dict[str, Any]],
     front_series: str
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
     """
     Module 2: Vertical Spread Monotonicity Violations.
     Commission Hurdle: 0.40 index points (2 legs * 0.20 pts).
@@ -410,28 +448,37 @@ def scan_vertical_spreads(
     - Put Monotonicity: For K1 < K2, if Put_Ask(K2) < Put_Bid(K1).
       Buy K2 @ Ask, Sell K1 @ Bid. Net credit = Put_Bid(K1) - Put_Ask(K2) - 0.40.
     """
-    COMMISSION = 0.40
+    COMMISSION = COMMISSION_2LEG_PTS
     opportunities: List[Dict[str, Any]] = []
     best_near_miss: Optional[Dict[str, Any]] = None
+    dropped_invalid_quotes = 0
+    calc_error_count = 0
 
     for ts in sorted(grouped_data.keys()):
         frame = grouped_data[ts]
         options = frame["options"]
 
         # 1. Evaluate Call Vertical Monotonicity
-        calls = [
-            opt for ((ser, k, otype), opt) in options.items()
-            if ser == front_series and otype == "C" and opt.get("bid") and opt.get("ask")
-            and opt["bid"] > 0 and opt["ask"] > 0 and opt["ask"] >= opt["bid"]
-        ]
+        calls = []
+        for ((ser, k, otype), opt) in options.items():
+            if ser == front_series and otype == "C":
+                bid, ask, vol = opt.get("bid"), opt.get("ask"), opt.get("volume", 0.0)
+                if (bid is None or ask is None or bid <= 0 or ask <= 0 or
+                    vol <= 0 or ask < bid):
+                    dropped_invalid_quotes += 1
+                else:
+                    calls.append(opt)
+
         calls.sort(key=lambda x: x["strike"])
 
         for i in range(len(calls)):
             for j in range(i + 1, len(calls)):
                 c1, c2 = calls[i], calls[j]
                 k1, k2 = c1["strike"], c2["strike"]
-                # Buy c1 @ ask, Sell c2 @ bid
                 gross = c2["bid"] - c1["ask"]
+                if math.isnan(gross) or math.isinf(gross):
+                    calc_error_count += 1
+                    continue
                 net = gross - COMMISSION
                 max_sets = int(min(c1.get("volume", 0.0), c2.get("volume", 0.0)))
 
@@ -456,19 +503,26 @@ def scan_vertical_spreads(
                         best_near_miss = item
 
         # 2. Evaluate Put Vertical Monotonicity
-        puts = [
-            opt for ((ser, k, otype), opt) in options.items()
-            if ser == front_series and otype == "P" and opt.get("bid") and opt.get("ask")
-            and opt["bid"] > 0 and opt["ask"] > 0 and opt["ask"] >= opt["bid"]
-        ]
+        puts = []
+        for ((ser, k, otype), opt) in options.items():
+            if ser == front_series and otype == "P":
+                bid, ask, vol = opt.get("bid"), opt.get("ask"), opt.get("volume", 0.0)
+                if (bid is None or ask is None or bid <= 0 or ask <= 0 or
+                    vol <= 0 or ask < bid):
+                    dropped_invalid_quotes += 1
+                else:
+                    puts.append(opt)
+
         puts.sort(key=lambda x: x["strike"])
 
         for i in range(len(puts)):
             for j in range(i + 1, len(puts)):
                 p1, p2 = puts[i], puts[j]
                 k1, k2 = p1["strike"], p2["strike"]
-                # Buy p2 @ ask, Sell p1 @ bid
                 gross = p1["bid"] - p2["ask"]
+                if math.isnan(gross) or math.isinf(gross):
+                    calc_error_count += 1
+                    continue
                 net = gross - COMMISSION
                 max_sets = int(min(p1.get("volume", 0.0), p2.get("volume", 0.0)))
 
@@ -492,23 +546,24 @@ def scan_vertical_spreads(
                     if best_near_miss is None or net > best_near_miss["net_pts"]:
                         best_near_miss = item
 
-    return opportunities, best_near_miss
+    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count
 
 
 def scan_calendar_spreads(
     grouped_data: Dict[str, Dict[str, Any]],
     front_series: str,
     next_series: str
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
     """
     Module 3: Calendar Spread Spike (Front vs Next Quarter Futures).
     Commission Hurdle: 0.40 index points (2 legs * 0.20 pts).
     Evaluates Front - Next calendar spread against intraday rolling mean +- 2 SD.
-    Filters out static dividend basis differences and captures transient execution dislocations.
     """
-    COMMISSION = 0.40
+    COMMISSION = COMMISSION_2LEG_PTS
     f1_sym = f"S50{front_series}"
     f2_sym = f"S50{next_series}"
+    dropped_invalid_quotes = 0
+    calc_error_count = 0
 
     spread_records = []
     for ts in sorted(grouped_data.keys()):
@@ -521,8 +576,9 @@ def scan_calendar_spreads(
         b1, a1, v1 = f1.get("bid"), f1.get("ask"), f1.get("volume", 0.0)
         b2, a2, v2 = f2.get("bid"), f2.get("ask"), f2.get("volume", 0.0)
 
-        if (b1 is None or a1 is None or b1 <= 0 or a1 <= 0 or a1 < b1 or
-            b2 is None or a2 is None or b2 <= 0 or a2 <= 0 or a2 < b2):
+        if (b1 is None or a1 is None or b1 <= 0 or a1 <= 0 or v1 <= 0 or a1 < b1 or
+            b2 is None or a2 is None or b2 <= 0 or a2 <= 0 or v2 <= 0 or a2 < b2):
+            dropped_invalid_quotes += 1
             continue
 
         mid1 = (b1 + a1) / 2.0
@@ -537,13 +593,11 @@ def scan_calendar_spreads(
         })
 
     if len(spread_records) < 10:
-        return [], None
+        return [], None, dropped_invalid_quotes, calc_error_count
 
     df_sp = pd.DataFrame(spread_records)
-    # 30-period rolling statistics
     df_sp["rolling_mean"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).mean()
     df_sp["rolling_std"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).std().fillna(0.15)
-    # Ensure min std to avoid false precision
     df_sp["rolling_std"] = df_sp["rolling_std"].clip(lower=0.10)
 
     opportunities: List[Dict[str, Any]] = []
@@ -558,9 +612,11 @@ def scan_calendar_spreads(
         max_sets = int(min(v1, v2))
 
         # Case 1: Spread Spikes UP -> Sell Front @ b1, Buy Next @ a2
-        # Executable spread = b1 - a2
         exec_sell_spread = b1 - a2
         dev_up = exec_sell_spread - mu
+        if math.isnan(dev_up) or math.isinf(dev_up):
+            calc_error_count += 1
+            continue
         net_up = dev_up - COMMISSION
 
         item_up = {
@@ -586,9 +642,11 @@ def scan_calendar_spreads(
                 best_near_miss = item_up
 
         # Case 2: Spread Spikes DOWN -> Buy Front @ a1, Sell Next @ b2
-        # Executable spread = a1 - b2
         exec_buy_spread = a1 - b2
         dev_down = mu - exec_buy_spread
+        if math.isnan(dev_down) or math.isinf(dev_down):
+            calc_error_count += 1
+            continue
         net_down = dev_down - COMMISSION
 
         item_down = {
@@ -604,7 +662,7 @@ def scan_calendar_spreads(
                 f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Vol: {v1:,.0f})",
                 f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Vol: {v2:,.0f})"
             ],
-            "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (-{dev_down:.2f} pts / -{(dev_down/std):.1f}σ)"
+            "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_down:.2f} pts / +{(dev_down/std):.1f}σ)"
         }
 
         if exec_buy_spread < (mu - 2.0 * std) and net_down > 0:
@@ -613,11 +671,11 @@ def scan_calendar_spreads(
             if best_near_miss is None or net_down > best_near_miss["net_pts"]:
                 best_near_miss = item_down
 
-    return opportunities, best_near_miss
+    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count
 
 
 # ==============================================================================
-# 5. TELEGRAM ALERT BUILDER & DISPATCHER
+# 5. TELEGRAM HTML FORMATTER & ALERT DISPATCHER
 # ==============================================================================
 
 def format_telegram_report(
@@ -625,14 +683,19 @@ def format_telegram_report(
     trade_date: str,
     profitable_opps: List[Dict[str, Any]],
     near_miss: Optional[Dict[str, Any]],
-    thor_rate: float
+    thor_rate: float,
+    dte: int,
+    T_years: float,
+    dropped_invalid_quotes: int,
+    calc_error_count: int,
+    valid_minutes: int
 ) -> str:
     """Formats actionable Thai arbitrage radar report for Telegram."""
     time_window_map = {
-        "MIDDAY": ("09:45", "12:30", "พักเที่ยง"),
-        "EVENING": ("09:45", "16:55", "ปิดตลาดเย็น")
+        "MIDDAY": ("09:45", "12:35", "พักเที่ยง"),
+        "EVENING": ("09:45", "17:05", "ปิดตลาดเย็น")
     }
-    t_start, t_end, sess_label = time_window_map.get(session_name, ("09:45", "16:55", session_name))
+    t_start, t_end, sess_label = time_window_map.get(session_name.upper(), ("09:45", "17:05", session_name))
 
     header = (
         f"⚡ <b>TFEX INTRADAY ARBITRAGE RADAR</b>\n"
@@ -640,9 +703,15 @@ def format_telegram_report(
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
+    meta_stats = (
+        f"• <b>บาร์ข้อมูลที่ประมวลผล:</b> {valid_minutes} นาที\n"
+        f"• <b>กรองข้อมูลไม่สมบูรณ์ (Bid/Ask/Vol ≤ 0):</b> {dropped_invalid_quotes:,} รายการ\n"
+        f"• <b>ข้อผิดพลาดในการคำนวณ (NaN/Inf):</b> {calc_error_count} รายการ\n"
+        f"• <b>อัตราดอกเบี้ย THOR อ้างอิง:</b> {thor_rate*100.0:.2f}% <i>(จาก eod_thor_rates)</i>\n"
+        f"• <b>อายุคงเหลือ (DTE):</b> {dte} วัน (T = {T_years:.4f} ปี)\n"
+    )
+
     if profitable_opps:
-        # Deduplicate & rank by net profit
-        # Group duplicates occurring within consecutive minutes on the same target
         ranked = sorted(profitable_opps, key=lambda x: x["net_pts"], reverse=True)
         top_3 = ranked[:3]
 
@@ -652,10 +721,10 @@ def format_telegram_report(
 
         summary_sec = (
             f"🎯 <b>สรุปโอกาส Arbitrage ที่พบ ({len(profitable_opps)} ครั้ง):</b>\n"
-            f"• <b>Put-Call Parity:</b> {parity_cnt} ครั้ง\n"
+            f"• <b>Put-Call Parity (Black-76):</b> {parity_cnt} ครั้ง\n"
             f"• <b>Vertical Spread:</b> {vertical_cnt} ครั้ง\n"
             f"• <b>Calendar Spread Spike:</b> {calendar_cnt} ครั้ง\n"
-            f"• <b>อัตราดอกเบี้ย THOR อ้างอิง:</b> {thor_rate*100.0:.2f}%\n"
+            f"{meta_stats}"
             f"───────────────────────\n"
             f"🏆 <b>TOP {len(top_3)} โอกาสกำไรสุทธิสูงสุด:</b>\n"
         )
@@ -695,13 +764,16 @@ def format_telegram_report(
                 f"• <b>เวลา:</b> <code>{near_miss['time']}</code>\n"
                 f"• <b>ราคาหน้ากระดาน:</b>\n{legs_str}\n"
                 f"• <b>ส่วนต่างสุทธิ:</b> <code>{near_miss['net_pts']:+.2f} จุด</code> "
-                f"<i>(ขาดอีก {shortfall:.2f} จุด ถึงจุดคุ้มทุนหลังหักค่าคอม {near_miss['commission_pts']:.2f} จุด)</i>"
+                f"<i>(ขาดอีก {shortfall:.2f} จุด ถึงจุดคุ้มทุนหลังหักค่าคอม {near_miss['commission_pts']:.2f} จุด)</i>\n"
             )
 
         content = (
             f"ℹ️ <b>ไม่พบช่องว่าง Arbitrage ที่คุ้มค่าคอม (0.40–0.60 จุด) ในรอบนี้</b>\n"
             f"<i>ตลาด SET50 Options & Futures มีประสิทธิภาพสูง (Efficient Market) สเปรดสะท้อนต้นทุนครบถ้วน</i>\n"
             f"{near_text}"
+            f"───────────────────────\n"
+            f"📊 <b>สถิติการตรวจสอบข้อมูล:</b>\n"
+            f"{meta_stats}"
         )
 
     footer = (
@@ -760,173 +832,147 @@ def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool
 
 
 # ==============================================================================
-# 6. TEST MODE GENERATOR
+# 6. MAIN CONTROLLER
 # ==============================================================================
 
-def generate_mock_arb_dataset(trade_date: str) -> Tuple[Dict[str, Dict[str, Any]], float]:
-    """Generates a realistic intraday snapshot dataset with intentional arbitrage cases for verification."""
-    front_series = "Z26"
-    next_series = "H27"
-    f1_sym = f"S50{front_series}"
-    f2_sym = f"S50{next_series}"
-    thor_rate = 0.0225
-
-    grouped: Dict[str, Dict[str, Any]] = {}
-    base_time = datetime.datetime.strptime(f"{trade_date} 10:00:00", "%Y-%m-%d %H:%M:%S")
-
-    # Generate 40 normal minutes
-    for m in range(40):
-        ts = (base_time + datetime.timedelta(minutes=m)).strftime("%Y-%m-%d %H:%M:%S")
-        f1_price = 1025.0 + math.sin(m / 5.0) * 1.5
-        f2_price = f1_price - 3.5  # Typical basis spread
-
-        grouped[ts] = {
-            "spot": f1_price - 0.2,
-            "futures": {
-                f1_sym: {"symbol": f1_sym, "bid": f1_price - 0.1, "ask": f1_price + 0.1, "last": f1_price, "volume": 120 + m * 5},
-                f2_sym: {"symbol": f2_sym, "bid": f2_price - 0.2, "ask": f2_price + 0.2, "last": f2_price, "volume": 60 + m * 2}
-            },
-            "options": {}
-        }
-
-        # Add strikes around 1000 - 1050
-        for k in range(1000, 1060, 10):
-            intrinsic_c = max(0.0, f1_price - k)
-            intrinsic_p = max(0.0, k - f1_price)
-            time_val = 8.0 - abs(f1_price - k) * 0.15
-            c_mid = intrinsic_c + max(0.5, time_val)
-            p_mid = intrinsic_p + max(0.5, time_val)
-
-            grouped[ts]["options"][(front_series, float(k), "C")] = {
-                "symbol": f"S50{front_series}C{k}", "series": front_series, "strike": float(k), "option_type": "C",
-                "bid": round(c_mid - 0.3, 2), "ask": round(c_mid + 0.3, 2), "last": round(c_mid, 2), "volume": 50 + m
-            }
-            grouped[ts]["options"][(front_series, float(k), "P")] = {
-                "symbol": f"S50{front_series}P{k}", "series": front_series, "strike": float(k), "option_type": "P",
-                "bid": round(p_mid - 0.3, 2), "ask": round(p_mid + 0.3, 2), "last": round(p_mid, 2), "volume": 45 + m
-            }
-
-    # Inject Arbitrage Opportunity 1: Put-Call Parity Reversal at 10:15
-    ts_arb1 = f"{trade_date} 10:15:00"
-    grouped[ts_arb1]["options"][(front_series, 1020.0, "C")]["ask"] = 12.0  # Underpriced Call
-    grouped[ts_arb1]["options"][(front_series, 1020.0, "P")]["bid"] = 10.5  # Overpriced Put
-    grouped[ts_arb1]["futures"][f1_sym]["bid"] = 1026.0
-
-    # Inject Arbitrage Opportunity 2: Vertical Monotonicity at 10:25
-    ts_arb2 = f"{trade_date} 10:25:00"
-    grouped[ts_arb2]["options"][(front_series, 1020.0, "C")]["ask"] = 11.20
-    grouped[ts_arb2]["options"][(front_series, 1030.0, "C")]["bid"] = 12.50  # Monotonicity breach
-
-    # Inject Arbitrage Opportunity 3: Calendar Spread Spike at 10:35
-    ts_arb3 = f"{trade_date} 10:35:00"
-    grouped[ts_arb3]["futures"][f1_sym]["bid"] = 1029.5  # Sudden transient spike in Front
-    grouped[ts_arb3]["futures"][f2_sym]["ask"] = 1021.0
-
-    return grouped, thor_rate
-
-
-# ==============================================================================
-# 7. MAIN ENGINE ORCHESTRATOR
-# ==============================================================================
-
-def run_arb_radar(session_name: str = "EVENING", no_telegram: bool = False, test_mode: bool = False):
-    """Main execution pipeline."""
+def run_arb_radar(session_name: str, target_date: Optional[str] = None, no_telegram: bool = False) -> None:
     start_time = datetime.datetime.now(BANGKOK_TZ)
     print("=" * 75)
-    print(f"TFEX INTRADAY ARBITRAGE RADAR | Session: {session_name}")
-    print(f"Timestamp: {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC+07:00")
+    print(f"TFEX INTRADAY ARBITRAGE RADAR | Session: {session_name.upper()}")
+    print(f"Timestamp: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print("=" * 75)
-
-    load_environment()
 
     turso_url = os.environ.get("TURSO_DATABASE_URL")
     turso_token = os.environ.get("TURSO_AUTH_TOKEN")
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
+    if not turso_url or not turso_token:
+        print("[ERROR] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not configured in environment.")
+        sys.exit(1)
+
+    pipeline_url = f"{turso_url.replace('libsql://', 'https://').rstrip('/')}/v2/pipeline"
+
+    # Determine target trade date
     now_bkk = datetime.datetime.now(BANGKOK_TZ)
-    today_str = now_bkk.strftime("%Y-%m-%d")
+    trade_date = target_date or now_bkk.strftime("%Y-%m-%d")
+    try:
+        trade_date_obj = datetime.datetime.strptime(trade_date, "%Y-%m-%d").date()
+    except Exception as e:
+        print(f"[ERROR] Invalid date format for --date ({trade_date}): {e}")
+        sys.exit(1)
 
     # Time boundaries
-    if session_name.upper() == "MIDDAY":
+    sess_upper = session_name.upper()
+    if sess_upper == "MIDDAY":
         t_start_bkk = "09:45:00"
         t_end_bkk = "12:35:00"
+        sess_label = "พักเที่ยง (09:45–12:35 น.)"
     else:  # EVENING
         t_start_bkk = "09:45:00"
         t_end_bkk = "17:05:00"
+        sess_label = "ปิดตลาดเย็น (09:45–17:05 น.)"
 
+    # 1. Strict Contract Discovery & Expiration / DTE
     cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
-    expiry_dt = parse_series_expiry(front_series, now_bkk.date())
-    days_to_exp = max(0.5, (expiry_dt.date() - now_bkk.date()).days)
-    T_years = days_to_exp / 365.0
+    try:
+        expiry_dt = parse_series_expiry(front_series, trade_date_obj)
+        dte = (expiry_dt.date() - trade_date_obj).days
+    except Exception as e:
+        err_msg = f"❌ <b>[ERROR] คำนวณวันหมดอายุซีรีส์ {front_series} ผิดพลาด: {e} — ยกเลิกการสแกน</b>"
+        print(f"[ERROR] parse_series_expiry error: {e}")
+        if tg_token and tg_chat_id and not no_telegram:
+            send_telegram_alert(tg_token, tg_chat_id, err_msg)
+        sys.exit(1)
 
-    print(f"[RADAR] Active Series: Front={front_series}, Next={next_series} (Days to exp: {days_to_exp})")
-
-    if test_mode:
-        print("[TEST] Executing in TEST MODE with realistic sample intraday data...")
-        grouped_data, thor_rate = generate_mock_arb_dataset(today_str)
-        trade_date = today_str
-    else:
-        if not turso_url or not turso_token:
-            print("[ERROR] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not configured.")
-            print("Tip: Use --test to test run locally with simulated market data.")
-            sys.exit(1)
-
-        pipeline_url = f"{turso_url.replace('libsql://', 'https://').rstrip('/')}/v2/pipeline"
-
-        # Determine target trade date (fallback to latest available in Turso if today is empty)
-        trade_date = today_str
-        try:
-            sql_check = f"SELECT COUNT(*) FROM futures_snapshots WHERE captured_at_bkk LIKE '{today_str}%';"
-            _, r_check = execute_turso_sql(pipeline_url, turso_token, sql_check)
-            if not r_check or int(r_check[0][0] or 0) == 0:
-                sql_latest = "SELECT MAX(SUBSTR(captured_at_bkk, 1, 10)) FROM futures_snapshots;"
-                _, r_lat = execute_turso_sql(pipeline_url, turso_token, sql_latest)
-                if r_lat and r_lat[0][0]:
-                    trade_date = str(r_lat[0][0])
-                    print(f"[DATA] No records for {today_str}. Falling back to latest trade date in Turso: {trade_date}")
-        except Exception as e:
-            print(f"[DATA] Note checking latest trade date: {e}")
-
-        print(f"[DATA] Fetching intraday dataset for {trade_date} ({t_start_bkk} - {t_end_bkk})...")
-        grouped_data, thor_rate = fetch_intraday_arb_dataset(
-            pipeline_url=pipeline_url,
-            auth_token=turso_token,
-            trade_date=trade_date,
-            start_time_bkk=t_start_bkk,
-            end_time_bkk=t_end_bkk
+    if dte <= 0:
+        err_msg = (
+            f"❌ <b>[ERROR] คำนวณวันหมดอายุซีรีส์ {front_series} ผิดพลาด (DTE = {dte} วัน) — ยกเลิกการสแกน</b>\n\n"
+            f"• <b>วันหมดอายุ:</b> <code>{expiry_dt.strftime('%Y-%m-%d')}</code>\n"
+            f"• <b>วันที่สแกน:</b> <code>{trade_date}</code>"
         )
+        print(f"[ERROR] Strict Validation: DTE <= 0 ({dte} days) for series {front_series}. Exiting.")
+        if tg_token and tg_chat_id and not no_telegram:
+            send_telegram_alert(tg_token, tg_chat_id, err_msg)
+        sys.exit(1)
 
-    print(f"[DATA] Synchronized minutes loaded: {len(grouped_data)} bars | THOR rate: {thor_rate*100.0:.2f}%")
+    T_years = dte / 365.0
+    print(f"[RADAR] Active Series: Front={front_series}, Next={next_series} | Expiry: {expiry_dt.strftime('%Y-%m-%d')} (DTE: {dte} days, T: {T_years:.4f}y)")
 
-    if not grouped_data:
-        print(f"[WARN] No synchronized market data found for {trade_date}. Exiting.")
-        return
+    # 2. Strict THOR Rate Retrieval (No Default)
+    print("[DATA] Fetching latest official THOR interest rate from eod_thor_rates...")
+    try:
+        thor_rate = fetch_thor_rate(pipeline_url, turso_token)
+        print(f"[DATA] Official THOR rate loaded: {thor_rate*100.0:.2f}%")
+    except Exception as e:
+        thor_err_msg = (
+            "❌ <b>[ERROR] ไม่พบข้อมูลอัตราดอกเบี้ย THOR ในฐานข้อมูล — ยกเลิกการสแกน</b>\n\n"
+            f"• <b>รายละเอียด:</b> {e}\n"
+            "• <b>คำแนะนำ:</b> ตรวจสอบการอัปเดตข้อมูลของ tfex-eod-collector"
+        )
+        print(f"[ERROR] Strict Validation Failed: {e}")
+        if tg_token and tg_chat_id and not no_telegram:
+            send_telegram_alert(tg_token, tg_chat_id, thor_err_msg)
+        sys.exit(1)
 
-    # Run Scan Modules
-    print("[SCAN] 1. Scanning Put-Call Parity (Conversion & Reversal)...")
-    parity_opps, near_parity = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
-    print(f"       Found {len(parity_opps)} profitable Put-Call Parity opportunities.")
+    # 3. Fetch Intraday Dataset from Turso (No Synthetic Fallback)
+    print(f"[DATA] Fetching intraday dataset for {trade_date} ({t_start_bkk} - {t_end_bkk})...")
+    grouped_data, fut_row_count, opt_row_count = fetch_intraday_arb_dataset(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        trade_date=trade_date,
+        start_time_bkk=t_start_bkk,
+        end_time_bkk=t_end_bkk
+    )
+
+    print(f"[DATA] Rows loaded from Turso: Futures={fut_row_count:,}, Options={opt_row_count:,}, Synchronized Minutes={len(grouped_data)}")
+
+    # 4. Strict 0-Row Check: Fail Loud & Alert Telegram
+    if fut_row_count == 0 or opt_row_count == 0 or len(grouped_data) == 0:
+        abort_msg = (
+            f"⚠️ <b>[ABORT] ไม่พบข้อมูล Intraday ใน Turso สำหรับวันที่ {trade_date} (รอบ {sess_label}) — งดการคำนวณ</b>\n\n"
+            f"• <b>ตาราง Futures:</b> {fut_row_count} แถว\n"
+            f"• <b>ตาราง Options:</b> {opt_row_count} แถว\n"
+            f"• <b>ช่วงเวลาที่ค้นหา:</b> {t_start_bkk} ถึง {t_end_bkk} น.\n"
+            f"• <b>คำแนะนำ:</b> ตรวจสอบสถานะการรันของ tfex-intraday-collector หรือตรวจเช็กวันหยุดทำการ TFEX"
+        )
+        print(f"[ABORT] ไม่พบข้อมูล Intraday ใน Turso สำหรับวันที่ {trade_date} (รอบ {sess_label}) — งดการคำนวณ")
+        if tg_token and tg_chat_id and not no_telegram:
+            send_telegram_alert(tg_token, tg_chat_id, abort_msg)
+        sys.exit(1)
+
+    # 5. Execute Arbitrage Scanners
+    print("[SCAN] 1. Scanning Put-Call Parity (Black-76: Conversion & Reversal)...")
+    parity_opps, near_parity, drop1, err1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
+    print(f"       Found {len(parity_opps)} profitable Parity opportunities (Dropped: {drop1:,}, Calc Errors: {err1}).")
 
     print("[SCAN] 2. Scanning Vertical Spread Monotonicity Violations...")
-    vert_opps, near_vert = scan_vertical_spreads(grouped_data, front_series)
-    print(f"       Found {len(vert_opps)} profitable Vertical Spread opportunities.")
+    vert_opps, near_vert, drop2, err2 = scan_vertical_spreads(grouped_data, front_series)
+    print(f"       Found {len(vert_opps)} profitable Vertical opportunities (Dropped: {drop2:,}, Calc Errors: {err2}).")
 
     print("[SCAN] 3. Scanning Calendar Spread Spikes (Front vs Next Quarter)...")
-    cal_opps, near_cal = scan_calendar_spreads(grouped_data, front_series, next_series)
-    print(f"       Found {len(cal_opps)} profitable Calendar Spread opportunities.")
+    cal_opps, near_cal, drop3, err3 = scan_calendar_spreads(grouped_data, front_series, next_series)
+    print(f"       Found {len(cal_opps)} profitable Calendar opportunities (Dropped: {drop3:,}, Calc Errors: {err3}).")
 
     all_opps = parity_opps + vert_opps + cal_opps
     all_nears = [n for n in [near_parity, near_vert, near_cal] if n is not None]
     best_near = max(all_nears, key=lambda x: x["net_pts"]) if all_nears else None
 
-    # Build Telegram Notification
+    total_dropped = drop1 + drop2 + drop3
+    total_calc_errors = err1 + err2 + err3
+
+    # 6. Build Telegram Report
     telegram_msg = format_telegram_report(
         session_name=session_name,
         trade_date=trade_date,
         profitable_opps=all_opps,
         near_miss=best_near,
-        thor_rate=thor_rate
+        thor_rate=thor_rate,
+        dte=dte,
+        T_years=T_years,
+        dropped_invalid_quotes=total_dropped,
+        calc_error_count=total_calc_errors,
+        valid_minutes=len(grouped_data)
     )
 
     print("\n" + "=" * 75)
@@ -936,7 +982,7 @@ def run_arb_radar(session_name: str = "EVENING", no_telegram: bool = False, test
     print("=" * 75)
     print(f"Message Length: {len(telegram_msg)} characters (Limit: 4096)")
 
-    # Dispatch to Telegram
+    # 7. Dispatch to Telegram
     if no_telegram:
         print("[TELEGRAM] --no-telegram supplied. Dispatch skipped.")
     elif tg_token and tg_chat_id:
@@ -961,9 +1007,9 @@ def run_arb_radar(session_name: str = "EVENING", no_telegram: bool = False, test
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TFEX Intraday Arbitrage Radar")
-    parser.add_argument("--session", choices=["MIDDAY", "EVENING"], default="EVENING", help="Trading session to scan")
+    parser.add_argument("--session", choices=["MIDDAY", "EVENING"], default="EVENING", help="Trading session to scan (MIDDAY or EVENING)")
+    parser.add_argument("--date", type=str, default=None, help="Target trade date (YYYY-MM-DD, default today)")
     parser.add_argument("--no-telegram", action="store_true", help="Skip sending Telegram alert")
-    parser.add_argument("--test", action="store_true", help="Run with simulated intraday dataset")
     args = parser.parse_args()
 
-    run_arb_radar(session_name=args.session, no_telegram=args.no_telegram, test_mode=args.test)
+    run_arb_radar(session_name=args.session, target_date=args.date, no_telegram=args.no_telegram)
