@@ -1,0 +1,59 @@
+name: TFEX Intraday Arbitrage Radar
+
+on:
+  schedule:
+    # 12:38 BKK (UTC+7) = 05:38 UTC (Mon-Fri) -> MIDDAY Session
+    - cron: '38 5 * * 1-5'
+    # 17:08 BKK (UTC+7) = 10:08 UTC (Mon-Fri) -> EVENING Session
+    - cron: '8 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      session:
+        description: 'Trading Session to scan (MIDDAY or EVENING)'
+        required: true
+        default: 'EVENING'
+        type: choice
+        options:
+          - MIDDAY
+          - EVENING
+
+jobs:
+  run-arbitrage-radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine Session Target
+        id: sess
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "target_session=${{ github.event.inputs.session }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "38 5 * * 1-5" ]; then
+            echo "target_session=MIDDAY" >> $GITHUB_OUTPUT
+          else
+            echo "target_session=EVENING" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Execute Arbitrage Scanner
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "Scanning TFEX Intraday Arbitrage for Session: ${{ steps.sess.outputs.target_session }}"
+          python arb_scanner.py --session ${{ steps.sess.outputs.target_session }}
