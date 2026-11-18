@@ -849,6 +849,20 @@ class ArbSmartCooldown:
         return alertable
 
 
+def format_action_leg(leg: str) -> str:
+    """
+    Parses leg description and formats with high-visibility actionable color tags:
+    - Buy -> 🟢 LONG (เคาะซื้อ):
+    - Sell -> 🔴 SHORT (เคาะขาย):
+    """
+    clean_leg = leg.strip()
+    if clean_leg.startswith("Buy "):
+        return f"🟢 <b>LONG (เคาะซื้อ):</b> {clean_leg[4:]}"
+    elif clean_leg.startswith("Sell "):
+        return f"🔴 <b>SHORT (เคาะขาย):</b> {clean_leg[5:]}"
+    return f"• {clean_leg}"
+
+
 def format_live_1min_alert(
     trade_date: str,
     bar_ts: str,
@@ -857,10 +871,10 @@ def format_live_1min_alert(
     dte: int,
     T_years: float
 ) -> str:
-    """Formats instant real-time Telegram alert for 1-minute detected arbitrage opportunities."""
+    """Formats instant real-time Telegram alert for 1-minute detected arbitrage opportunities with complete execution details."""
     header = (
-        f"🚨 <b>[LIVE 1-MIN ARB] โอกาสเคาะทำกำไรทันที!</b>\n"
-        f"📅 <i>ข้อมูลวันที่ {trade_date} | เวลา <code>{bar_ts}</code></i>\n"
+        f"🚨 <b>[LIVE ARBITRAGE ALERT] ตรวจพบโอกาสทำกำไรทันที!</b>\n"
+        f"📅 <i>ข้อมูลวันที่ {trade_date} | เวลา <code>{bar_ts} น.</code></i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -872,7 +886,7 @@ def format_live_1min_alert(
     calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
 
     meta_stats = (
-        f"• <b>อัตราดอกเบี้ย THOR:</b> {thor_rate*100.0:.2f}% | <b>DTE:</b> {dte} วัน\n"
+        f"• <b>อัตราดอกเบี้ย THOR:</b> {thor_rate*100.0:.2f}% | <b>DTE คงเหลือ:</b> {dte} วัน\n"
         f"• <b>ตรวจพบ:</b> {len(profitable_opps)} รายการ (Parity: {parity_cnt}, Vertical: {vertical_cnt}, Calendar: {calendar_cnt})"
     )
 
@@ -880,28 +894,38 @@ def format_live_1min_alert(
         f"⚡ <b>พบสัญญาณเคาะกำไรสุทธิ (Real-time Execution):</b>\n"
         f"{meta_stats}\n"
         f"───────────────────────\n"
-        f"🏆 <b>โอกาสทำกำไรสูงสุด (Strict Bid/Ask):</b>\n"
+        f"🏆 <b>โอกาสทำกำไรสูงสุด (Strict Executable Prices):</b>\n"
     )
 
     medals = ["🥇 [1]", "🥈 [2]", "🥉 [3]"]
     opp_blocks = []
     for idx, opp in enumerate(top_3):
         medal = medals[idx] if idx < len(medals) else f"• [{idx+1}]"
+        gross_pts = opp["gross_pts"]
+        comm_pts = opp["commission_pts"]
         net_pts = opp["net_pts"]
+        gross_thb_set = gross_pts * CONTRACT_MULTIPLIER
+        comm_thb_set = comm_pts * CONTRACT_MULTIPLIER
         net_thb_per_set = net_pts * CONTRACT_MULTIPLIER
         m_sets = opp["max_sets"]
         tot_thb = net_thb_per_set * m_sets if m_sets > 0 else net_thb_per_set
 
-        legs_str = "\n".join([f"    - {leg}" for leg in opp["legs"]])
-        stats_line = f"\n  • <b>สถิติ:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
+        action_checklist = "\n".join([f"    {format_action_leg(leg)}" for leg in opp["legs"]])
+        legs_count = len(opp["legs"])
+        stats_line = f"\n  📊 <b>สถิติสเปรด:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
 
         block = (
-            f"{medal} <b>{opp['strategy']} | {opp['target']} {opp.get('tag', '')}</b>\n"
-            f"  • <b>เวลาที่เกิด:</b> <code>{opp['time']}</code>\n"
-            f"  • <b>ขาการเทรด (เคาะทันที):</b>\n{legs_str}\n"
-            f"  • <b>ปริมาณที่เปิดได้ทันที:</b> <b>{m_sets}</b> ชุด (min leg vol){stats_line}\n"
-            f"  • <b>กำไรสุทธิต่อชุด:</b> 🟢 <b>+{net_pts:.2f} จุด</b> (+{net_thb_per_set:,.0f} บาท/ชุด)\n"
-            f"  • <b>มูลค่ากำไรรวม:</b> <b>+{tot_thb:,.0f} บาท</b> (หักค่าคอม {opp['commission_pts']:.2f} จุดแล้ว)"
+            f"{medal} <b>{opp['strategy']}</b>\n"
+            f"  📌 <b>เป้าหมาย:</b> <code>{opp['target']}</code> {opp.get('tag', '')}\n"
+            f"  ⏱ <b>เวลาตรวจพบ:</b> <code>{opp['time']} น.</code>\n\n"
+            f"  👉 <b>ขั้นตอนส่งคำสั่งทันที (Execution Checklist):</b>\n"
+            f"{action_checklist}\n\n"
+            f"  💵 <b>โครงสร้างต้นทุนและกำไร (Financial Breakdown):</b>\n"
+            f"    • <b>กำไรส่วนต่างขั้นต้น (Gross):</b> <code>+{gross_pts:.2f} จุด</code> (+{gross_thb_set:,.0f} บาท/ชุด)\n"
+            f"    • <b>หักค่าคอมมิชชัน ({legs_count} ขา @ 40 บ.):</b> <code>-{comm_pts:.2f} จุด</code> (-{comm_thb_set:,.0f} บาท/ชุด)\n"
+            f"    • <b>กำไรสุทธิคงเหลือ (Net Profit):</b> 🟢 <b>+{net_pts:.2f} จุด (+{net_thb_per_set:,.0f} บาท/ชุด)</b>\n"
+            f"    • <b>สภาพคล่องที่เคาะได้ทันที:</b> <b>{m_sets}</b> สัญญา (อิง Minimum Leg Depth)\n"
+            f"    • <b>มูลค่ากำไรสุทธิรวมทั้งพอร์ต:</b> 💰 <b>+{tot_thb:,.0f} บาท</b>{stats_line}"
         )
         opp_blocks.append(block)
 
@@ -1006,19 +1030,21 @@ def format_telegram_report(
         opp_blocks = []
         for idx, opp in enumerate(top_3):
             medal = medals[idx] if idx < len(medals) else f"• [{idx+1}]"
+            gross_pts = opp["gross_pts"]
+            comm_pts = opp["commission_pts"]
             net_pts = opp["net_pts"]
             net_thb_per_set = net_pts * CONTRACT_MULTIPLIER
             m_sets = opp["max_sets"]
             tot_thb = net_thb_per_set * m_sets if m_sets > 0 else net_thb_per_set
 
-            legs_str = "\n".join([f"    - {leg}" for leg in opp["legs"]])
-            stats_line = f"\n  • <b>สถิติ:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
+            action_checklist = "\n".join([f"    {format_action_leg(leg)}" for leg in opp["legs"]])
+            legs_count = len(opp["legs"])
+            stats_line = f"\n  📊 <b>สถิติ:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
 
             block = (
-                f"{medal} <b>{opp['strategy']} | {opp['target']}</b>\n"
-                f"  • <b>เวลา:</b> <code>{opp['time']}</code> | <b>ปริมาณรองรับ:</b> <b>{m_sets}</b> ชุด{stats_line}\n"
-                f"  • <b>ราคาเคาะ (Strict Bid/Ask):</b>\n{legs_str}\n"
-                f"  ➔ <b>กำไรสุทธิ:</b> 🟢 <b>+{net_pts:.2f} จุด</b> (+{tot_thb:,.0f} บาท หักคอมแล้ว)"
+                f"{medal} <b>{opp['strategy']} | {opp['target']}</b> (<code>{opp['time']}</code>, {m_sets} ชุด)\n"
+                f"{action_checklist}\n"
+                f"  ➔ Gross: <code>+{gross_pts:.2f}</code> | คอม ({legs_count} ขา): <code>-{comm_pts:.2f}</code> | <b>Net: 🟢 +{net_pts:.2f} จุด (+{net_thb_per_set:,.0f} บ./ชุด) | รวม: 💰 +{tot_thb:,.0f} บาท</b>{stats_line}"
             )
             opp_blocks.append(block)
 
@@ -1088,7 +1114,7 @@ def format_telegram_report(
         comm_pts = near_miss.get("commission_pts", 0.60)
         net_pts = near_miss.get("net_pts", 0.0)
         spread_cost = near_miss.get("spread_cost", abs(net_pts + comm_pts - mid_edge))
-        legs_str = "\n".join([f"    - {leg}" for leg in near_miss.get("legs", [])])
+        legs_str = "\n".join([f"    {format_action_leg(leg)}" for leg in near_miss.get("legs", [])])
 
         if net_pts < 0:
             shortfall = abs(net_pts)
