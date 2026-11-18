@@ -21,7 +21,7 @@ Strict Fail-Loud / No Silent Fallback Rules:
 - Strict THOR Rate: Must exist in eod_thor_rates; fail loud if missing/NULL/<=0.
 - Strict DTE / T_years: Must calculate from actual series expiry; fail loud if DTE <= 0.
 - Strict Bid/Ask: Never use 'last' in place of bid/ask. Drop any row with bid<=0, ask<=0,
-  vol<=0, or ask<bid, and report dropped_invalid_quotes count.
+  or ask<bid, and report dropped_invalid_quotes count.
 - Commission Hurdle:
   - 2-leg strategies (Vertical / Calendar): 0.40 pts (40 THB/leg round-turn = 80 THB).
   - 3-leg strategies (Conversion / Reversal): 0.60 pts (120 THB).
@@ -358,7 +358,7 @@ def scan_put_call_parity(
         f_vol = fut.get("volume", 0.0)
 
         if (f_bid is None or f_ask is None or f_bid <= 0 or f_ask <= 0 or
-            f_vol <= 0 or f_ask < f_bid):
+            f_ask < f_bid):
             dropped_invalid_quotes += 1
             continue
 
@@ -381,17 +381,17 @@ def scan_put_call_parity(
             c_vol, p_vol = c_quote.get("volume", 0.0), p_quote.get("volume", 0.0)
 
             if (c_bid is None or c_ask is None or c_bid <= 0 or c_ask <= 0 or
-                c_vol <= 0 or c_ask < c_bid):
+                c_ask < c_bid):
                 dropped_invalid_quotes += 1
                 continue
             if (p_bid is None or p_ask is None or p_bid <= 0 or p_ask <= 0 or
-                p_vol <= 0 or p_ask < p_bid):
+                p_ask < p_bid):
                 dropped_invalid_quotes += 1
                 continue
 
             c_mid = (c_bid + c_ask) / 2.0
             p_mid = (p_bid + p_ask) / 2.0
-            max_sets = int(min(c_vol, p_vol, f_vol))
+            max_sets = int(min(c_vol, p_vol, f_vol)) if (c_vol > 0 and p_vol > 0 and f_vol > 0) else 1
             liq_tag = "[Liquid: Spot±30]" if abs(k - ref_price) <= 30.0 else "[Deep Strike: ถือจนหมดอายุ]"
 
             # 1. Conversion: (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
@@ -506,7 +506,7 @@ def scan_vertical_spreads(
             if ser == front_series and otype == "C":
                 bid, ask, vol = opt.get("bid"), opt.get("ask"), opt.get("volume", 0.0)
                 if (bid is None or ask is None or bid <= 0 or ask <= 0 or
-                    vol <= 0 or ask < bid):
+                    ask < bid):
                     dropped_invalid_quotes += 1
                 else:
                     calls.append(opt)
@@ -527,7 +527,8 @@ def scan_vertical_spreads(
                     continue
                 net = gross - COMMISSION
                 spread_cost = mid_edge - gross
-                max_sets = int(min(c1.get("volume", 0.0), c2.get("volume", 0.0)))
+                v_c1, v_c2 = c1.get("volume", 0.0), c2.get("volume", 0.0)
+                max_sets = int(min(v_c1, v_c2)) if (v_c1 > 0 and v_c2 > 0) else 1
 
                 item = {
                     "strategy": "Call Monotonicity Violation",
@@ -561,7 +562,7 @@ def scan_vertical_spreads(
             if ser == front_series and otype == "P":
                 bid, ask, vol = opt.get("bid"), opt.get("ask"), opt.get("volume", 0.0)
                 if (bid is None or ask is None or bid <= 0 or ask <= 0 or
-                    vol <= 0 or ask < bid):
+                    ask < bid):
                     dropped_invalid_quotes += 1
                 else:
                     puts.append(opt)
@@ -582,7 +583,8 @@ def scan_vertical_spreads(
                     continue
                 net = gross - COMMISSION
                 spread_cost = mid_edge - gross
-                max_sets = int(min(p1.get("volume", 0.0), p2.get("volume", 0.0)))
+                v_p1, v_p2 = p1.get("volume", 0.0), p2.get("volume", 0.0)
+                max_sets = int(min(v_p1, v_p2)) if (v_p1 > 0 and v_p2 > 0) else 1
 
                 item = {
                     "strategy": "Put Monotonicity Violation",
@@ -636,8 +638,8 @@ def scan_calendar_spreads(
         b1, a1, v1 = f1.get("bid"), f1.get("ask"), f1.get("volume", 0.0)
         b2, a2, v2 = f2.get("bid"), f2.get("ask"), f2.get("volume", 0.0)
 
-        if (b1 is None or a1 is None or b1 <= 0 or a1 <= 0 or v1 <= 0 or a1 < b1 or
-            b2 is None or a2 is None or b2 <= 0 or a2 <= 0 or v2 <= 0 or a2 < b2):
+        if (b1 is None or a1 is None or b1 <= 0 or a1 <= 0 or a1 < b1 or
+            b2 is None or a2 is None or b2 <= 0 or a2 <= 0 or a2 < b2):
             dropped_invalid_quotes += 1
             continue
 
@@ -669,7 +671,7 @@ def scan_calendar_spreads(
         b2, a2, v2 = row["b2"], row["a2"], row["v2"]
         mu = row["rolling_mean"]
         std = row["rolling_std"]
-        max_sets = int(min(v1, v2))
+        max_sets = int(min(v1, v2)) if (v1 > 0 and v2 > 0) else 1
 
         # Case 1: Spread Spikes UP -> Sell Front @ b1, Buy Next @ a2
         mid1 = (b1 + a1) / 2.0
@@ -1115,7 +1117,7 @@ def format_telegram_report(
     # Data Audit (Condensed into 2 lines)
     audit_sec = (
         f"───────────────────────\n"
-        f"🔍 <b>Data Audit:</b> ประมวลผล <code>{valid_minutes}</code> บาร์ | กรอง Bid/Ask/Vol≤0: <code>{dropped_invalid_quotes:,}</code> | Error: <code>{calc_error_count}</code>\n"
+        f"🔍 <b>Data Audit:</b> ประมวลผล <code>{valid_minutes}</code> บาร์ | กรอง Bid/Ask ผิดปกติ: <code>{dropped_invalid_quotes:,}</code> | Error: <code>{calc_error_count}</code>\n"
         f"📌 <b>ตัวแปรอ้างอิง:</b> THOR <code>{thor_rate*100.0:.2f}%</code> | DTE <code>{dte} วัน</code> (T = {T_years:.4f} ปี) | คอม 40 บ./สัญญา/ขา"
     )
 

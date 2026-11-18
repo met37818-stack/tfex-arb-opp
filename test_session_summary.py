@@ -291,9 +291,56 @@ def test_telegram_message_no_profitable_opps():
     print("✅ Efficient Market Scenario Verified!")
 
 
+def test_zero_traded_volume_with_valid_quotes():
+    """Verifies that quotes with volume=0 (no trades yet today) but valid Bid/Ask are NOT dropped."""
+    front_series = "Z26"
+    next_series = "H27"
+    thor_rate = 0.0225
+    T_years = 42.0 / 365.0
+
+    # Build data where all volume=0.0
+    grouped = {}
+    for i in range(15):
+        ts = f"10:{i:02d}:00"
+        grouped[ts] = {
+            "spot": 920.0,
+            "futures": {
+                f"S50{front_series}": {"bid": 920.0, "ask": 920.4, "volume": 0.0},
+                f"S50{next_series}": {"bid": 922.0, "ask": 922.5, "volume": 0.0}
+            },
+            "options": {
+                (front_series, 920.0, "C"): {"bid": 10.0, "ask": 10.5, "volume": 0.0, "strike": 920.0, "series": front_series, "option_type": "C"},
+                (front_series, 920.0, "P"): {"bid": 9.0, "ask": 9.5, "volume": 0.0, "strike": 920.0, "series": front_series, "option_type": "P"},
+                (front_series, 930.0, "C"): {"bid": 5.0, "ask": 5.5, "volume": 0.0, "strike": 930.0, "series": front_series, "option_type": "C"},
+                (front_series, 930.0, "P"): {"bid": 14.0, "ask": 14.5, "volume": 0.0, "strike": 930.0, "series": front_series, "option_type": "P"},
+            }
+        }
+
+    p_opps, near_p, d1, e1, p_mins = scan_put_call_parity(grouped, front_series, thor_rate, T_years)
+    v_opps, near_v, d2, e2, v_mins = scan_vertical_spreads(grouped, front_series)
+    c_opps, near_c, d3, e3, c_mins = scan_calendar_spreads(grouped, front_series, next_series)
+
+    # ZERO dropped quotes because all bid/ask are valid even though volume=0!
+    assert d1 == 0, f"Expected 0 dropped in parity, got {d1}"
+    assert d2 == 0, f"Expected 0 dropped in vertical, got {d2}"
+    assert d3 == 0, f"Expected 0 dropped in calendar, got {d3}"
+
+    # Near misses must NOT be None
+    assert near_p is not None, "near_p must not be None when quotes are valid"
+    assert near_v is not None, "near_v must not be None when quotes are valid"
+    assert near_c is not None, "near_c must not be None when quotes are valid"
+
+    # Default max_sets should be >= 1
+    assert near_p["max_sets"] >= 1
+    assert near_v["max_sets"] >= 1
+    assert near_c["max_sets"] >= 1
+    print("✅ Zero Traded Volume with Valid Bids/Asks Correctly Evaluated (Not Dropped)!")
+
+
 if __name__ == "__main__":
     test_scan_and_friction_breakdown()
     test_best_of_minute_stats()
     test_telegram_message_formatting_and_length()
     test_telegram_message_no_profitable_opps()
+    test_zero_traded_volume_with_valid_quotes()
     print("\n🎉 ALL UNIT TESTS PASSED SUCCESSFULLY!")
