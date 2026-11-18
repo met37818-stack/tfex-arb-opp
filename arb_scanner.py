@@ -335,7 +335,7 @@ def scan_put_call_parity(
     front_series: str,
     thor_rate: float,
     T_years: float
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int, Dict[str, float]]:
     COMMISSION = COMMISSION_3LEG_PTS
     fut_sym = f"S50{front_series}"
     disc_factor = math.exp(-thor_rate * T_years)
@@ -344,6 +344,7 @@ def scan_put_call_parity(
     best_near_miss: Optional[Dict[str, Any]] = None
     dropped_invalid_quotes = 0
     calc_error_count = 0
+    minute_bests: Dict[str, float] = {}
 
     for ts in sorted(grouped_data.keys()):
         frame = grouped_data[ts]
@@ -362,6 +363,7 @@ def scan_put_call_parity(
             continue
 
         ref_price = spot_ref or ((f_bid + f_ask) / 2.0)
+        f_mid = (f_bid + f_ask) / 2.0
 
         strikes = set()
         for (ser, k, otype) in frame["options"].keys():
@@ -387,11 +389,16 @@ def scan_put_call_parity(
                 dropped_invalid_quotes += 1
                 continue
 
+            c_mid = (c_bid + c_ask) / 2.0
+            p_mid = (p_bid + p_ask) / 2.0
             max_sets = int(min(c_vol, p_vol, f_vol))
             liq_tag = "[Liquid: Spot±30]" if abs(k - ref_price) <= 30.0 else "[Deep Strike: ถือจนหมดอายุ]"
 
             # 1. Conversion: (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
             try:
+                disc_diff_mid = (f_mid - k) * disc_factor
+                mid_edge_conv = (c_mid - p_mid) - disc_diff_mid
+
                 disc_diff_conv = (f_ask - k) * disc_factor
                 gross_conv = (c_bid - p_ask) - disc_diff_conv
                 if math.isnan(gross_conv) or math.isinf(gross_conv):
@@ -403,14 +410,18 @@ def scan_put_call_parity(
 
             if gross_conv is not None:
                 net_conv = gross_conv - COMMISSION
+                spread_cost_conv = mid_edge_conv - gross_conv
                 item_conv = {
                     "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
                     "target": f"Strike {k:.0f} & {fut_sym}",
                     "tag": liq_tag,
                     "time": ts,
+                    "series": front_series,
                     "strike": k,
                     "gross_pts": gross_conv,
                     "net_pts": net_conv,
+                    "mid_edge": mid_edge_conv,
+                    "spread_cost": spread_cost_conv,
                     "commission_pts": COMMISSION,
                     "max_sets": max_sets,
                     "legs": [
@@ -419,14 +430,19 @@ def scan_put_call_parity(
                         f"Buy Futures {fut_sym} @ Ask <code>{f_ask:.2f}</code> (Vol: {f_vol:,.0f})"
                     ]
                 }
+                if ts not in minute_bests or net_conv > minute_bests[ts]:
+                    minute_bests[ts] = net_conv
+
                 if net_conv > 0:
                     opportunities.append(item_conv)
-                else:
-                    if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
-                        best_near_miss = item_conv
+                if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
+                    best_near_miss = item_conv
 
             # 2. Reversal: (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
             try:
+                disc_diff_mid = (f_mid - k) * disc_factor
+                mid_edge_rev = disc_diff_mid - (c_mid - p_mid)
+
                 disc_diff_rev = (f_bid - k) * disc_factor
                 gross_rev = disc_diff_rev - (c_ask - p_bid)
                 if math.isnan(gross_rev) or math.isinf(gross_rev):
@@ -438,14 +454,18 @@ def scan_put_call_parity(
 
             if gross_rev is not None:
                 net_rev = gross_rev - COMMISSION
+                spread_cost_rev = mid_edge_rev - gross_rev
                 item_rev = {
                     "strategy": "Reversal (Buy C, Sell P, Sell Fut)",
                     "target": f"Strike {k:.0f} & {fut_sym}",
                     "tag": liq_tag,
                     "time": ts,
+                    "series": front_series,
                     "strike": k,
                     "gross_pts": gross_rev,
                     "net_pts": net_rev,
+                    "mid_edge": mid_edge_rev,
+                    "spread_cost": spread_cost_rev,
                     "commission_pts": COMMISSION,
                     "max_sets": max_sets,
                     "legs": [
@@ -454,24 +474,27 @@ def scan_put_call_parity(
                         f"Sell Futures {fut_sym} @ Bid <code>{f_bid:.2f}</code> (Vol: {f_vol:,.0f})"
                     ]
                 }
+                if ts not in minute_bests or net_rev > minute_bests[ts]:
+                    minute_bests[ts] = net_rev
+
                 if net_rev > 0:
                     opportunities.append(item_rev)
-                else:
-                    if best_near_miss is None or net_rev > best_near_miss["net_pts"]:
-                        best_near_miss = item_rev
+                if best_near_miss is None or net_rev > best_near_miss["net_pts"]:
+                    best_near_miss = item_rev
 
-    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count
+    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count, minute_bests
 
 
 def scan_vertical_spreads(
     grouped_data: Dict[str, Dict[str, Any]],
     front_series: str
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int, Dict[str, float]]:
     COMMISSION = COMMISSION_2LEG_PTS
     opportunities: List[Dict[str, Any]] = []
     best_near_miss: Optional[Dict[str, Any]] = None
     dropped_invalid_quotes = 0
     calc_error_count = 0
+    minute_bests: Dict[str, float] = {}
 
     for ts in sorted(grouped_data.keys()):
         frame = grouped_data[ts]
@@ -494,11 +517,16 @@ def scan_vertical_spreads(
             for j in range(i + 1, len(calls)):
                 c1, c2 = calls[i], calls[j]
                 k1, k2 = c1["strike"], c2["strike"]
+                c1_mid = (c1["bid"] + c1["ask"]) / 2.0
+                c2_mid = (c2["bid"] + c2["ask"]) / 2.0
+                mid_edge = c2_mid - c1_mid
+
                 gross = c2["bid"] - c1["ask"]
                 if math.isnan(gross) or math.isinf(gross):
                     calc_error_count += 1
                     continue
                 net = gross - COMMISSION
+                spread_cost = mid_edge - gross
                 max_sets = int(min(c1.get("volume", 0.0), c2.get("volume", 0.0)))
 
                 item = {
@@ -506,8 +534,12 @@ def scan_vertical_spreads(
                     "target": f"Call {k1:.0f}/{k2:.0f} ({front_series})",
                     "tag": "[Vertical Spread]",
                     "time": ts,
+                    "series": front_series,
+                    "strike_pair": f"{k1:.0f}/{k2:.0f}",
                     "gross_pts": gross,
                     "net_pts": net,
+                    "mid_edge": mid_edge,
+                    "spread_cost": spread_cost,
                     "commission_pts": COMMISSION,
                     "max_sets": max_sets,
                     "legs": [
@@ -515,11 +547,13 @@ def scan_vertical_spreads(
                         f"Sell Call {k2:.0f} @ Bid <code>{c2['bid']:.2f}</code> (Vol: {c2.get('volume', 0):,.0f})"
                     ]
                 }
+                if ts not in minute_bests or net > minute_bests[ts]:
+                    minute_bests[ts] = net
+
                 if net > 0:
                     opportunities.append(item)
-                else:
-                    if best_near_miss is None or net > best_near_miss["net_pts"]:
-                        best_near_miss = item
+                if best_near_miss is None or net > best_near_miss["net_pts"]:
+                    best_near_miss = item
 
         # Put Monotonicity
         puts = []
@@ -538,11 +572,16 @@ def scan_vertical_spreads(
             for j in range(i + 1, len(puts)):
                 p1, p2 = puts[i], puts[j]
                 k1, k2 = p1["strike"], p2["strike"]
+                p1_mid = (p1["bid"] + p1["ask"]) / 2.0
+                p2_mid = (p2["bid"] + p2["ask"]) / 2.0
+                mid_edge = p1_mid - p2_mid
+
                 gross = p1["bid"] - p2["ask"]
                 if math.isnan(gross) or math.isinf(gross):
                     calc_error_count += 1
                     continue
                 net = gross - COMMISSION
+                spread_cost = mid_edge - gross
                 max_sets = int(min(p1.get("volume", 0.0), p2.get("volume", 0.0)))
 
                 item = {
@@ -550,8 +589,12 @@ def scan_vertical_spreads(
                     "target": f"Put {k1:.0f}/{k2:.0f} ({front_series})",
                     "tag": "[Vertical Spread]",
                     "time": ts,
+                    "series": front_series,
+                    "strike_pair": f"{k1:.0f}/{k2:.0f}",
                     "gross_pts": gross,
                     "net_pts": net,
+                    "mid_edge": mid_edge,
+                    "spread_cost": spread_cost,
                     "commission_pts": COMMISSION,
                     "max_sets": max_sets,
                     "legs": [
@@ -559,25 +602,28 @@ def scan_vertical_spreads(
                         f"Sell Put {k1:.0f} @ Bid <code>{p1['bid']:.2f}</code> (Vol: {p1.get('volume', 0):,.0f})"
                     ]
                 }
+                if ts not in minute_bests or net > minute_bests[ts]:
+                    minute_bests[ts] = net
+
                 if net > 0:
                     opportunities.append(item)
-                else:
-                    if best_near_miss is None or net > best_near_miss["net_pts"]:
-                        best_near_miss = item
+                if best_near_miss is None or net > best_near_miss["net_pts"]:
+                    best_near_miss = item
 
-    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count
+    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count, minute_bests
 
 
 def scan_calendar_spreads(
     grouped_data: Dict[str, Dict[str, Any]],
     front_series: str,
     next_series: str
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], int, int, Dict[str, float]]:
     COMMISSION = COMMISSION_2LEG_PTS
     f1_sym = f"S50{front_series}"
     f2_sym = f"S50{next_series}"
     dropped_invalid_quotes = 0
     calc_error_count = 0
+    minute_bests: Dict[str, float] = {}
 
     spread_records = []
     for ts in sorted(grouped_data.keys()):
@@ -607,7 +653,7 @@ def scan_calendar_spreads(
         })
 
     if len(spread_records) < 10:
-        return [], None, dropped_invalid_quotes, calc_error_count
+        return [], None, dropped_invalid_quotes, calc_error_count, {}
 
     df_sp = pd.DataFrame(spread_records)
     df_sp["rolling_mean"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).mean()
@@ -626,20 +672,29 @@ def scan_calendar_spreads(
         max_sets = int(min(v1, v2))
 
         # Case 1: Spread Spikes UP -> Sell Front @ b1, Buy Next @ a2
+        mid1 = (b1 + a1) / 2.0
+        mid2 = (b2 + a2) / 2.0
+        mid_spread = mid1 - mid2
+        mid_edge_up = mid_spread - mu
+
         exec_sell_spread = b1 - a2
         dev_up = exec_sell_spread - mu
         if math.isnan(dev_up) or math.isinf(dev_up):
             calc_error_count += 1
             continue
         net_up = dev_up - COMMISSION
+        spread_cost_up = mid_edge_up - dev_up
 
         item_up = {
             "strategy": "Calendar Spread Spike (Overextended High)",
             "target": f"{f1_sym} - {f2_sym}",
             "tag": "[Calendar Spread]",
             "time": ts,
+            "series": f"{front_series}-{next_series}",
             "gross_pts": dev_up,
             "net_pts": net_up,
+            "mid_edge": mid_edge_up,
+            "spread_cost": spread_cost_up,
             "commission_pts": COMMISSION,
             "max_sets": max_sets,
             "legs": [
@@ -648,28 +703,34 @@ def scan_calendar_spreads(
             ],
             "stats": f"Spread: {exec_sell_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_up:.2f} pts / +{(dev_up/std):.1f}σ)"
         }
+        if ts not in minute_bests or net_up > minute_bests[ts]:
+            minute_bests[ts] = net_up
 
         if exec_sell_spread > (mu + 2.0 * std) and net_up > 0:
             opportunities.append(item_up)
-        else:
-            if best_near_miss is None or net_up > best_near_miss["net_pts"]:
-                best_near_miss = item_up
+        if best_near_miss is None or net_up > best_near_miss["net_pts"]:
+            best_near_miss = item_up
 
         # Case 2: Spread Spikes DOWN -> Buy Front @ a1, Sell Next @ b2
         exec_buy_spread = a1 - b2
         dev_down = mu - exec_buy_spread
+        mid_edge_down = mu - mid_spread
         if math.isnan(dev_down) or math.isinf(dev_down):
             calc_error_count += 1
             continue
         net_down = dev_down - COMMISSION
+        spread_cost_down = mid_edge_down - dev_down
 
         item_down = {
             "strategy": "Calendar Spread Spike (Overextended Low)",
             "target": f"{f1_sym} - {f2_sym}",
             "tag": "[Calendar Spread]",
             "time": ts,
+            "series": f"{front_series}-{next_series}",
             "gross_pts": dev_down,
             "net_pts": net_down,
+            "mid_edge": mid_edge_down,
+            "spread_cost": spread_cost_down,
             "commission_pts": COMMISSION,
             "max_sets": max_sets,
             "legs": [
@@ -678,14 +739,15 @@ def scan_calendar_spreads(
             ],
             "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_down:.2f} pts / +{(dev_down/std):.1f}σ)"
         }
+        if ts not in minute_bests or net_down > minute_bests[ts]:
+            minute_bests[ts] = net_down
 
         if exec_buy_spread < (mu - 2.0 * std) and net_down > 0:
             opportunities.append(item_down)
-        else:
-            if best_near_miss is None or net_down > best_near_miss["net_pts"]:
-                best_near_miss = item_down
+        if best_near_miss is None or net_down > best_near_miss["net_pts"]:
+            best_near_miss = item_down
 
-    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count
+    return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count, minute_bests
 
 
 # ==============================================================================
@@ -850,6 +912,59 @@ def format_live_1min_alert(
     return f"{header}\n\n{content}\n\n{footer}"
 
 
+def compute_best_of_minute_stats(
+    grouped_data_keys: List[str],
+    p_mins: Dict[str, float],
+    v_mins: Dict[str, float],
+    c_mins: Dict[str, float]
+) -> Dict[str, Any]:
+    minute_bests = []
+    for ts in sorted(grouped_data_keys):
+        candidates = []
+        if ts in p_mins:
+            candidates.append(p_mins[ts])
+        if ts in v_mins:
+            candidates.append(v_mins[ts])
+        if ts in c_mins:
+            candidates.append(c_mins[ts])
+        if candidates:
+            minute_bests.append(max(candidates))
+
+    if not minute_bests:
+        return {
+            "has_data": False,
+            "bar_count": 0,
+            "max": 0.0,
+            "p90": 0.0,
+            "avg": 0.0,
+            "sd": 0.0,
+            "near_be_cnt": 0,
+            "near_be_pct": 0.0,
+            "series": []
+        }
+
+    arr = np.array(minute_bests, dtype=float)
+    bar_cnt = len(arr)
+    max_val = float(np.max(arr))
+    p90_val = float(np.percentile(arr, 90))
+    avg_val = float(np.mean(arr))
+    sd_val = float(np.std(arr, ddof=1)) if bar_cnt > 1 else 0.0
+    near_be_cnt = int(np.sum(arr >= -0.25))
+    near_be_pct = (near_be_cnt / bar_cnt * 100.0) if bar_cnt > 0 else 0.0
+
+    return {
+        "has_data": True,
+        "bar_count": bar_cnt,
+        "max": max_val,
+        "p90": p90_val,
+        "avg": avg_val,
+        "sd": sd_val,
+        "near_be_cnt": near_be_cnt,
+        "near_be_pct": near_be_pct,
+        "series": minute_bests
+    }
+
+
 def format_telegram_report(
     session_title: str,
     trade_date: str,
@@ -860,21 +975,15 @@ def format_telegram_report(
     T_years: float,
     dropped_invalid_quotes: int,
     calc_error_count: int,
-    valid_minutes: int
+    valid_minutes: int,
+    minute_stats: Optional[Dict[str, Any]] = None,
+    strategy_nears: Optional[Dict[str, Any]] = None
 ) -> str:
-    """Formats full session summary report for Telegram (always delivered)."""
+    """Formats full session summary report for Telegram with market tightness stats and friction breakdown."""
     header = (
         f"⚡ <b>TFEX INTRADAY ARBITRAGE RADAR</b>\n"
         f"📅 <i>ข้อมูลวันที่ {trade_date} | รอบ {session_title}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    meta_stats = (
-        f"• <b>บาร์ข้อมูลที่ประมวลผล:</b> {valid_minutes} นาที\n"
-        f"• <b>กรองข้อมูลไม่สมบูรณ์ (Bid/Ask/Vol ≤ 0):</b> {dropped_invalid_quotes:,} รายการ\n"
-        f"• <b>ข้อผิดพลาดในการคำนวณ (NaN/Inf):</b> {calc_error_count} รายการ\n"
-        f"• <b>อัตราดอกเบี้ย THOR อ้างอิง:</b> {thor_rate*100.0:.2f}% <i>(จาก eod_thor_rates)</i>\n"
-        f"• <b>อายุคงเหลือ (DTE):</b> {dte} วัน (T = {T_years:.4f} ปี)\n"
     )
 
     if profitable_opps:
@@ -886,13 +995,9 @@ def format_telegram_report(
         calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
 
         summary_sec = (
-            f"🎯 <b>สรุปโอกาส Arbitrage ที่พบ ({len(profitable_opps)} ครั้ง):</b>\n"
-            f"• <b>Put-Call Parity (Black-76):</b> {parity_cnt} ครั้ง\n"
-            f"• <b>Vertical Spread:</b> {vertical_cnt} ครั้ง\n"
-            f"• <b>Calendar Spread Spike:</b> {calendar_cnt} ครั้ง\n"
-            f"{meta_stats}"
-            f"───────────────────────\n"
-            f"🏆 <b>TOP {len(top_3)} โอกาสกำไรสุทธิสูงสุด:</b>\n"
+            f"🎯 <b>พบโอกาส Arbitrage กำไรสุทธิ ({len(profitable_opps)} ครั้ง):</b>\n"
+            f"• <b>Put-Call Parity:</b> {parity_cnt} ครั้ง | <b>Vertical:</b> {vertical_cnt} ครั้ง | <b>Calendar:</b> {calendar_cnt} ครั้ง\n\n"
+            f"🏆 <b>TOP {len(top_3)} โอกาสกำไรสูงสุด:</b>"
         )
 
         medals = ["🥇 [1]", "🥈 [2]", "🥉 [3]"]
@@ -908,46 +1013,128 @@ def format_telegram_report(
             stats_line = f"\n  • <b>สถิติ:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
 
             block = (
-                f"{medal} <b>{opp['strategy']} | {opp['target']} {opp.get('tag', '')}</b>\n"
-                f"  • <b>เวลาที่เกิด:</b> <code>{opp['time']}</code>\n"
-                f"  • <b>ขาการเทรด (Strict Bid/Ask):</b>\n{legs_str}\n"
-                f"  • <b>ปริมาณที่เปิดได้ (Executable):</b> <b>{m_sets}</b> ชุด (min leg vol){stats_line}\n"
-                f"  • <b>กำไรสุทธิต่อชุด:</b> 🟢 <b>+{net_pts:.2f} จุด</b> (+{net_thb_per_set:,.0f} บาท/ชุด)\n"
-                f"  • <b>มูลค่ากำไรรวม:</b> <b>+{tot_thb:,.0f} บาท</b> (หักค่าคอม {opp['commission_pts']:.2f} จุดแล้ว)"
+                f"{medal} <b>{opp['strategy']} | {opp['target']}</b>\n"
+                f"  • <b>เวลา:</b> <code>{opp['time']}</code> | <b>ปริมาณรองรับ:</b> <b>{m_sets}</b> ชุด{stats_line}\n"
+                f"  • <b>ราคาเคาะ (Strict Bid/Ask):</b>\n{legs_str}\n"
+                f"  ➔ <b>กำไรสุทธิ:</b> 🟢 <b>+{net_pts:.2f} จุด</b> (+{tot_thb:,.0f} บาท หักคอมแล้ว)"
             )
             opp_blocks.append(block)
 
-        content = summary_sec + "\n\n".join(opp_blocks)
+        status_block = summary_sec + "\n\n" + "\n\n".join(opp_blocks)
     else:
-        near_text = ""
-        if near_miss:
-            shortfall = abs(near_miss["net_pts"])
-            legs_str = "\n".join([f"  - {leg}" for leg in near_miss["legs"]])
-            near_text = (
-                f"───────────────────────\n"
-                f"🔍 <b>Near-Miss (คู่ที่เข้าใกล้จุดคุ้มทุนที่สุด):</b>\n"
-                f"• <b>กลยุทธ์:</b> {near_miss['strategy']} | {near_miss['target']}\n"
-                f"• <b>เวลา:</b> <code>{near_miss['time']}</code>\n"
-                f"• <b>ราคาหน้ากระดาน:</b>\n{legs_str}\n"
-                f"• <b>ส่วนต่างสุทธิ:</b> <code>{near_miss['net_pts']:+.2f} จุด</code> "
-                f"<i>(ขาดอีก {shortfall:.2f} จุด ถึงจุดคุ้มทุนหลังหักค่าคอม {near_miss['commission_pts']:.2f} จุด)</i>\n"
-            )
-
-        content = (
+        status_block = (
             f"ℹ️ <b>ไม่พบช่องว่าง Arbitrage ที่คุ้มค่าคอม (0.40–0.60 จุด) ในรอบนี้</b>\n"
-            f"<i>ตลาด SET50 Options & Futures มีประสิทธิภาพสูง (Efficient Market) สเปรดสะท้อนต้นทุนครบถ้วน</i>\n"
-            f"{near_text}"
-            f"───────────────────────\n"
-            f"📊 <b>สถิติการตรวจสอบข้อมูล:</b>\n"
-            f"{meta_stats}"
+            f"<i>ตลาด SET50 Options & Futures มีประสิทธิภาพสูง (Efficient Market) สเปรดสะท้อนต้นทุนครบถ้วน</i>"
         )
+
+    # Best-of-Minute Distribution Stats
+    if minute_stats and minute_stats.get("has_data"):
+        m_cnt = minute_stats["bar_count"]
+        m_max = minute_stats["max"]
+        m_p90 = minute_stats["p90"]
+        m_avg = minute_stats["avg"]
+        m_sd = minute_stats["sd"]
+        m_near_cnt = minute_stats["near_be_cnt"]
+        m_near_pct = minute_stats["near_be_pct"]
+        dist_sec = (
+            f"───────────────────────\n"
+            f"📊 <b>พฤติกรรมความตึงของตลาด (Best-of-Minute Stats):</b>\n"
+            f"• <b>สถิติ Net Profit สูงสุดรายนาที ({m_cnt} บาร์):</b>\n"
+            f"  - <b>Max:</b> <code>{m_max:+.2f} จุด</code> | <b>P90:</b> <code>{m_p90:+.2f} จุด</code>\n"
+            f"  - <b>Avg:</b> <code>{m_avg:+.2f} จุด</code> | <b>SD:</b> <code>{m_sd:.2f} จุด</code>\n"
+            f"• <b>เข้าใกล้จุดคุ้มทุน (Net ≥ -0.25 จุด):</b> <code>{m_near_cnt}/{m_cnt} นาที ({m_near_pct:.1f}%)</code>"
+        )
+    else:
+        dist_sec = ""
+
+    # Strategy Breakdown (Near-Miss Top 1 per Strategy)
+    if strategy_nears:
+        np_item = strategy_nears.get("parity")
+        nv_item = strategy_nears.get("vertical")
+        nc_item = strategy_nears.get("calendar")
+
+        if np_item:
+            st_name = "Conversion" if "Conversion" in np_item["strategy"] else ("Reversal" if "Reversal" in np_item["strategy"] else np_item["strategy"])
+            p_line = f"{st_name} {np_item.get('series', '')} Strike <code>{np_item.get('strike', 0):.0f}</code> (<code>{np_item['time']}</code>, <code>{np_item.get('max_sets', 0)}</code> ชุด) ➔ Net: <code>{np_item['net_pts']:+.2f} จุด</code>"
+        else:
+            p_line = "<i>N/A (ไม่มีสภาพคล่องครบขา)</i>"
+
+        if nv_item:
+            st_name = "Call Spread" if "Call" in nv_item["strategy"] else ("Put Spread" if "Put" in nv_item["strategy"] else nv_item["strategy"])
+            v_line = f"{st_name} <code>{nv_item.get('strike_pair', '')}</code> ({nv_item.get('series', '')}) (<code>{nv_item['time']}</code>, <code>{nv_item.get('max_sets', 0)}</code> ชุด) ➔ Net: <code>{nv_item['net_pts']:+.2f} จุด</code>"
+        else:
+            v_line = "<i>N/A (ไม่มีสภาพคล่องครบขา)</i>"
+
+        if nc_item:
+            c_line = f"{nc_item.get('series', nc_item['target'])} (<code>{nc_item['time']}</code>, <code>{nc_item.get('max_sets', 0)}</code> ชุด) ➔ Net: <code>{nc_item['net_pts']:+.2f} จุด</code>"
+        else:
+            c_line = "<i>N/A (ไม่มีสภาพคล่องครบขา)</i>"
+
+        strat_sec = (
+            f"───────────────────────\n"
+            f"🎯 <b>Near-Miss Top 1 รายกลยุทธ์ (คู่ที่ใกล้จุดคุ้มทุนที่สุด):</b>\n"
+            f"• <b>Put-Call Parity:</b> {p_line}\n"
+            f"• <b>Vertical Spread:</b> {v_line}\n"
+            f"• <b>Calendar Spread:</b> {c_line}"
+        )
+    else:
+        strat_sec = ""
+
+    # Friction Breakdown of Top 1 Pair
+    if near_miss:
+        mid_edge = near_miss.get("mid_edge", 0.0)
+        comm_pts = near_miss.get("commission_pts", 0.60)
+        net_pts = near_miss.get("net_pts", 0.0)
+        spread_cost = near_miss.get("spread_cost", abs(net_pts + comm_pts - mid_edge))
+        legs_str = "\n".join([f"    - {leg}" for leg in near_miss.get("legs", [])])
+
+        if net_pts < 0:
+            shortfall = abs(net_pts)
+            net_desc = f"ขาดอีก {shortfall:.2f} จุด ถึงจุดคุ้มทุน"
+        else:
+            net_desc = f"กำไรสุทธิ +{net_pts:.2f} จุด (+{net_pts * CONTRACT_MULTIPLIER:,.0f} บ./ชุด)"
+
+        friction_sec = (
+            f"───────────────────────\n"
+            f"🔬 <b>ผ่าโครงสร้างต้นทุนคู่ที่ดีที่สุดอันดับ 1 (Friction Breakdown):</b>\n"
+            f"• <b>คู่ที่ดีที่สุด:</b> {near_miss['strategy']} | {near_miss['target']}\n"
+            f"• <b>เวลา:</b> <code>{near_miss['time']}</code> | <b>ปริมาณรองรับ:</b> <b>{near_miss.get('max_sets', 0)}</b> ชุด\n"
+            f"• <b>ราคาหน้ากระดาน (Strict Bid/Ask):</b>\n{legs_str}\n"
+            f"• <b>Theoretical Edge (Mid-Price):</b> <code>{mid_edge:+.2f} จุด</code> <i>(ความเพี้ยนราคาก่อนหักค่าถ่าง)</i>\n"
+            f"• <b>Spread Slippage Cost:</b> <code>-{spread_cost:.2f} จุด</code> <i>(ต้นทุนเคาะข้าม Bid-Ask)</i>\n"
+            f"• <b>Commission Cost:</b> <code>-{comm_pts:.2f} จุด</code> <i>(ค่าคอมมิชชันไป-กลับ)</i>\n"
+            f"➔ <b>Net Profit สุทธิ:</b> <code>{net_pts:+.2f} จุด</code> <i>({net_desc})</i>"
+        )
+    else:
+        friction_sec = (
+            f"───────────────────────\n"
+            f"🔬 <b>ผ่าโครงสร้างต้นทุนคู่ที่ดีที่สุดอันดับ 1 (Friction Breakdown):</b>\n"
+            f"• <i>N/A (ไม่มีคู่ที่มีสภาพคล่องสมบูรณ์ในเซสชันนี้)</i>"
+        )
+
+    # Data Audit (Condensed into 2 lines)
+    audit_sec = (
+        f"───────────────────────\n"
+        f"🔍 <b>Data Audit:</b> ประมวลผล <code>{valid_minutes}</code> บาร์ | กรอง Bid/Ask/Vol≤0: <code>{dropped_invalid_quotes:,}</code> | Error: <code>{calc_error_count}</code>\n"
+        f"📌 <b>ตัวแปรอ้างอิง:</b> THOR <code>{thor_rate*100.0:.2f}%</code> | DTE <code>{dte} วัน</code> (T = {T_years:.4f} ปี) | คอม 40 บ./สัญญา/ขา"
+    )
 
     footer = (
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <i>TFEX Arbitrage Radar | คำนวณจาก Bid/Ask จริง และหักค่าคอม 40 บ./สัญญา/ขา</i>"
+        f"🤖 <i>TFEX Arbitrage Radar | คำนวณจาก Bid/Ask จริง และหักค่าคอมมิชชันครบทุกขา</i>"
     )
 
-    return f"{header}\n\n{content}\n\n{footer}"
+    body_parts = [header, status_block]
+    if dist_sec:
+        body_parts.append(dist_sec)
+    if strat_sec:
+        body_parts.append(strat_sec)
+    if friction_sec:
+        body_parts.append(friction_sec)
+    body_parts.append(audit_sec)
+    body_parts.append(footer)
+
+    return "\n\n".join(body_parts)
 
 
 # ==============================================================================
@@ -1118,10 +1305,10 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
 
             if new_ts_found in session_dataset:
                 single_bar = {new_ts_found: session_dataset[new_ts_found]}
-                p_opps, _, d1, e1 = scan_put_call_parity(single_bar, front_series, thor_rate, T_years)
-                v_opps, _, d2, e2 = scan_vertical_spreads(single_bar, front_series)
+                p_opps, _, d1, e1, _ = scan_put_call_parity(single_bar, front_series, thor_rate, T_years)
+                v_opps, _, d2, e2, _ = scan_vertical_spreads(single_bar, front_series)
                 # Calendar spreads use rolling session_dataset, filtered by current bar timestamp
-                c_opps, _, d3, e3 = scan_calendar_spreads(session_dataset, front_series, next_series)
+                c_opps, _, d3, e3, _ = scan_calendar_spreads(session_dataset, front_series, next_series)
                 c_curr = [c for c in c_opps if c.get("time") == new_ts_found]
 
                 bar_all_opps = p_opps + v_opps + c_curr
@@ -1182,13 +1369,26 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
             send_telegram_alert(tg_token, tg_chat_id, abort_msg)
         sys.exit(1)
 
-    p_opps, near_p, d1, e1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
-    v_opps, near_v, d2, e2 = scan_vertical_spreads(grouped_data, front_series)
-    c_opps, near_c, d3, e3 = scan_calendar_spreads(grouped_data, front_series, next_series)
+    p_opps, near_p, d1, e1, p_mins = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
+    v_opps, near_v, d2, e2, v_mins = scan_vertical_spreads(grouped_data, front_series)
+    c_opps, near_c, d3, e3, c_mins = scan_calendar_spreads(grouped_data, front_series, next_series)
 
     all_opps = p_opps + v_opps + c_opps
     all_nears = [n for n in [near_p, near_v, near_c] if n is not None]
     best_near = max(all_nears, key=lambda x: x["net_pts"]) if all_nears else None
+
+    minute_stats = compute_best_of_minute_stats(
+        grouped_data_keys=list(grouped_data.keys()),
+        p_mins=p_mins,
+        v_mins=v_mins,
+        c_mins=c_mins
+    )
+
+    strategy_nears = {
+        "parity": near_p,
+        "vertical": near_v,
+        "calendar": near_c
+    }
 
     summary_msg = format_telegram_report(
         session_title=summary_title,
@@ -1200,7 +1400,9 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         T_years=T_years,
         dropped_invalid_quotes=(d1 + d2 + d3),
         calc_error_count=(e1 + e2 + e3),
-        valid_minutes=len(grouped_data)
+        valid_minutes=len(grouped_data),
+        minute_stats=minute_stats,
+        strategy_nears=strategy_nears
     )
 
     print("\n" + "=" * 75)
@@ -1277,13 +1479,26 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
             send_telegram_alert(tg_token, tg_chat_id, abort_msg)
         sys.exit(1)
 
-    p_opps, near_p, d1, e1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
-    v_opps, near_v, d2, e2 = scan_vertical_spreads(grouped_data, front_series)
-    c_opps, near_c, d3, e3 = scan_calendar_spreads(grouped_data, front_series, next_series)
+    p_opps, near_p, d1, e1, p_mins = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
+    v_opps, near_v, d2, e2, v_mins = scan_vertical_spreads(grouped_data, front_series)
+    c_opps, near_c, d3, e3, c_mins = scan_calendar_spreads(grouped_data, front_series, next_series)
 
     all_opps = p_opps + v_opps + c_opps
     all_nears = [n for n in [near_p, near_v, near_c] if n is not None]
     best_near = max(all_nears, key=lambda x: x["net_pts"]) if all_nears else None
+
+    minute_stats = compute_best_of_minute_stats(
+        grouped_data_keys=list(grouped_data.keys()),
+        p_mins=p_mins,
+        v_mins=v_mins,
+        c_mins=c_mins
+    )
+
+    strategy_nears = {
+        "parity": near_p,
+        "vertical": near_v,
+        "calendar": near_c
+    }
 
     report_msg = format_telegram_report(
         session_title=sess_title,
@@ -1295,7 +1510,9 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         T_years=T_years,
         dropped_invalid_quotes=(d1 + d2 + d3),
         calc_error_count=(e1 + e2 + e3),
-        valid_minutes=len(grouped_data)
+        valid_minutes=len(grouped_data),
+        minute_stats=minute_stats,
+        strategy_nears=strategy_nears
     )
 
     print("\n" + "=" * 75)
