@@ -1154,10 +1154,13 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         t_start_bkk = "09:45:00"
         t_end_bkk = "12:35:00"
         sess_title = "พักเที่ยง (09:45–12:35 น.)"
-    else:
+    elif sess_upper == "EVENING":
         t_start_bkk = "09:45:00"
         t_end_bkk = "17:05:00"
         sess_title = "ปิดตลาดเย็น (09:45–17:05 น.)"
+    else:
+        print(f"[ERROR] Unsupported single scan session: '{session_name}'. Expected 'MIDDAY' or 'EVENING'.")
+        sys.exit(1)
 
     cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
     expiry_dt = parse_series_expiry(front_series, trade_date_obj)
@@ -1231,9 +1234,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TFEX Intraday Arbitrage Radar")
     parser.add_argument(
         "--session",
-        choices=["MORNING_WORKER", "AFTERNOON_WORKER", "MIDDAY", "EVENING"],
-        default="MORNING_WORKER",
-        help="Execution session mode"
+        type=str.upper,
+        choices=["MIDDAY", "EVENING", "MORNING_WORKER", "AFTERNOON_WORKER"],
+        default="MIDDAY",
+        help="Execution session mode (MIDDAY, EVENING, MORNING_WORKER, AFTERNOON_WORKER)"
     )
     parser.add_argument("--date", type=str, default=None, help="Target trade date (YYYY-MM-DD, default today)")
     parser.add_argument("--no-telegram", action="store_true", help="Skip sending Telegram alert")
@@ -1241,5 +1245,8 @@ if __name__ == "__main__":
 
     if args.session in ["MORNING_WORKER", "AFTERNOON_WORKER"]:
         run_arb_worker(session_mode=args.session, target_date=args.date, no_telegram=args.no_telegram)
-    else:
+    elif args.session in ["MIDDAY", "EVENING"]:
         run_single_scan(session_name=args.session, target_date=args.date, no_telegram=args.no_telegram)
+    else:
+        print(f"[ERROR] Invalid session: {args.session}. Must be one of MIDDAY, EVENING, MORNING_WORKER, AFTERNOON_WORKER.")
+        sys.exit(1)
