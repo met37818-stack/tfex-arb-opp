@@ -1,6 +1,6 @@
-# TFEX Intraday Arbitrage Radar (`tfex-arb-opp`)
+# TFEX Real-time 1-Minute Arbitrage Radar (`tfex-arb-opp`)
 
-ระบบสแกนและแจ้งเตือนโอกาส **Arbitrage** ในตลาด **TFEX SET50 Index Futures & Options** แบบเรียลไทม์ระหว่างวัน จากข้อมูล Intraday Snapshot ใน Turso Cloud SQLite พร้อมส่งรายงานเข้า Telegram วันละ 2 รอบ
+ระบบสแกนและแจ้งเตือนโอกาส **Arbitrage** ในตลาด **TFEX SET50 Index Futures & Options** แบบเรียลไทม์ **ราย 1 นาที (1-Minute High-Frequency Sync)** จากข้อมูล Intraday Snapshot ใน Turso Cloud SQLite พร้อมส่งสัญญาณเข้า Telegram ทันทีที่พบโอกาส และสรุปภาพรวมปิดเซสชันวันละ 2 รอบ
 
 ---
 
@@ -23,42 +23,45 @@
 
 ## 🛡️ กฎการคำนวณตามการ Execution จริง (Strict Rules)
 
-- **Strict Bid/Ask:** ซื้อที่ราคา `Ask` และขายที่ราคา `Bid` เท่านั้น
+- **Immediate Execution (เคาะซื้อขายทันที):** ซื้อที่ราคา `Ask` (ต้องมี `ask > 0` และ `volume > 0`) และขายที่ราคา `Bid` (ต้องมี `bid > 0` และ `volume > 0`) เท่านั้น ห้ามใช้ราคา `Last` หรือ `Mid` เด็ดขาด
 - **Executable Sets (`max_sets`):** คำนวณจาก `min(volume)` ของทุกขาที่เกี่ยวข้องในนาทีเดียวกัน (`captured_at_bkk` ตรงกันเป๊ะ)
-- **Near-Miss Evaluation:** หากไม่พบโอกาสที่ได้กำไรสุทธิ (> 0 จุด) ระบบจะรายงานคู่ที่เข้าใกล้จุดคุ้มทุนที่สุด
-- **Strict Validation on Session Input:** บังคับตรวจสอบค่า `--session` (MIDDAY, EVENING, MORNING_WORKER, AFTERNOON_WORKER) หากระบุผิดหรือไม่ระบุจะตัดจบการทำงานด้วย Error ทันที (No Silent Fallback)
+- **1-Minute Sync Mechanism:** ในแต่ละนาที จะรอจนถึงวินาทีที่ `:06` หรือ Poll เช็ก `MAX(captured_at_bkk)` ใน `futures_snapshots` และ `options_snapshots` ทุก 3 วินาที เพื่อให้มั่นใจว่าข้อมูลทั้งสองตารางบันทึกเสร็จสมบูรณ์แล้วจึงดึงมาประมวลผลทันที
+- **Smart Anti-Spam Cooldown (15 นาที):** เมื่อพบโอกาสทำกำไรสุทธิ (> 0 จุด) จะแจ้งเตือนทันที (`🚨 [LIVE 1-MIN ARB] โอกาสเคาะทำกำไรทันที!`) และเก็บ Cache ไว้ 15 นาที หากคู่เดิมยังคงอยู่จะไม่สแปมซ้ำ ยกเว้นกรณีที่กำไรสุทธิกระโดดเพิ่มขึ้นอย่างน้อย `+0.20 จุด` หรือเป็น Strike/กลยุทธ์ใหม่ จะยิงแจ้งเตือนทันที
+- **Strict Validation on Session Input:** บังคับตรวจสอบค่า `--session` (MORNING_WORKER, AFTERNOON_WORKER, MIDDAY, EVENING) หากระบุผิดหรือไม่ระบุจะตัดจบการทำงานด้วย Error ทันที (No Silent Fallback)
 
 ---
 
-## ⏰ รอบการแจ้งเตือนอัตโนมัติ (Triggered via cron-job.org)
+## ⏰ รอบการทำงานอัตโนมัติ (Triggered via cron-job.org)
 
-ปลุกการทำงานผ่าน GitHub Actions REST API (`workflow_dispatch`) วันละ 2 รอบ:
+ปลุก Persistent Worker ผ่าน GitHub Actions REST API (`workflow_dispatch`) วันละ 2 รอบล่วงหน้าก่อนตลาดเปิด 5 นาที:
 
-- **รอบพักเที่ยง (MIDDAY):** 12:38 น. (เวลาไทย) — สแกนช่วงเช้า 09:45–12:35 น.
-- **รอบปิดตลาดเย็น (EVENING):** 17:08 น. (เวลาไทย) — สแกนทั้งวัน 09:45–17:05 น.
+- **รอบเช้า (`MORNING_WORKER`):** ปลุกที่ **09:40 น.** (สแตนด์บายรอจนถึง 09:45 แล้ววนลูปสแกนทุก 1 นาทีจนถึง 12:35 น. พร้อมส่งสรุปปิดรอบเช้า)
+- **รอบบ่าย (`AFTERNOON_WORKER`):** ปลุกที่ **14:10 น.** (สแตนด์บายรอจนถึง 14:15 แล้ววนลูปสแกนทุก 1 นาทีจนถึง 17:05 น. พร้อมส่งสรุปภาพรวมทั้งวัน)
 
-### ตัวอย่าง JSON Payload สำหรับยิง GitHub REST API:
+### Exact JSON Payload สำหรับตั้งค่าใน `cron-job.org`:
 - Endpoint: `POST https://api.github.com/repos/{owner}/tfex-arb-opp/actions/workflows/arb_radar.yml/dispatches`
 
-**รอบ MIDDAY (12:38 น.):**
+**1) รอบเช้า (09:40 น. BKK):**
 ```json
 {
   "ref": "main",
   "inputs": {
-    "session": "MIDDAY"
+    "session": "MORNING_WORKER"
   }
 }
 ```
 
-**รอบ EVENING (17:08 น.):**
+**2) รอบบ่าย (14:10 น. BKK):**
 ```json
 {
   "ref": "main",
   "inputs": {
-    "session": "EVENING"
+    "session": "AFTERNOON_WORKER"
   }
 }
 ```
+
+*(หมายเหตุ: โหมด Single-Shot สำหรับทดสอบด่วนยังคงรองรับ `inputs.session`: `MIDDAY` และ `EVENING` เช่นเดิม)*
 
 ---
 
@@ -68,9 +71,15 @@
 # ติดตั้ง dependencies
 pip install -r requirements.txt
 
-# รันจริงกับฐานข้อมูล Turso รอบพักเที่ยง
+# รัน Real-time 1-Minute Worker รอบเช้า
+python arb_scanner.py --session MORNING_WORKER
+
+# รัน Real-time 1-Minute Worker รอบบ่าย
+python arb_scanner.py --session AFTERNOON_WORKER
+
+# รันแบบ Single-shot สแกนเฉพาะรอบพักเที่ยง
 python arb_scanner.py --session MIDDAY
 
-# รันจริงกับฐานข้อมูล Turso รอบปิดตลาดเย็น
+# รันแบบ Single-shot สแกนสรุปทั้งวัน
 python arb_scanner.py --session EVENING
 ```

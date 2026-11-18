@@ -1,18 +1,18 @@
-name: TFEX Intraday Arbitrage Radar
+name: TFEX Real-time 1-Minute Arbitrage Radar
 
 on:
   workflow_dispatch:
     inputs:
       session:
-        description: 'Trading Session to scan (MIDDAY, EVENING, MORNING_WORKER, or AFTERNOON_WORKER)'
+        description: 'Trading Session to scan (MORNING_WORKER, AFTERNOON_WORKER, MIDDAY, or EVENING)'
         required: true
-        default: 'MIDDAY'
+        default: 'MORNING_WORKER'
         type: choice
         options:
-          - MIDDAY
-          - EVENING
           - MORNING_WORKER
           - AFTERNOON_WORKER
+          - MIDDAY
+          - EVENING
 
 jobs:
   run-arbitrage-radar:

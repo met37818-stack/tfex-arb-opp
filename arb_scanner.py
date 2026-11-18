@@ -1,16 +1,16 @@
 """
-TFEX Intraday Arbitrage Radar (arb_scanner.py)
-==============================================
-Scans high-frequency intraday snapshots from Turso Cloud SQLite to discover
+TFEX Real-time 1-Minute Intraday Arbitrage Radar (arb_scanner.py)
+================================================================
+Scans high-frequency 1-minute intraday snapshots from Turso Cloud SQLite to discover
 real executable arbitrage opportunities across:
 1. Put-Call Parity (Black-76 Futures Options: Conversion & Reversal)
 2. Vertical Spread Monotonicity Violations (Call & Put)
 3. Calendar Spread Spikes (Front vs Next Quarter Futures)
 
 Modes:
-- Real-time Worker (--session MORNING_WORKER / AFTERNOON_WORKER):
-  Runs a 15-minute pulse loop (:00, :15, :30, :45 + 10s offset).
-  Anti-Spam: Alerts to Telegram ONLY when net profit > 0 is detected.
+- Real-time 1-Minute Worker (--session MORNING_WORKER / AFTERNOON_WORKER):
+  Runs a continuous 1-minute loop synced with Turso (:06 offset / 3s polling).
+  Anti-Spam: Alerts to Telegram LIVE when net profit > 0 is detected (Smart 15-min cooldown per strike/strategy, bypasses on +0.20 pts profit spike).
   At session end (12:35 / 17:05): Dispatches full session summary report to Telegram.
 - Single-Shot (--session MIDDAY / EVENING):
   Runs full session scan and immediately outputs summary report.
@@ -734,22 +734,69 @@ def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool
         return False
 
 
-def format_15min_pulse_alert(
+class ArbSmartCooldown:
+    """
+    In-memory smart cooldown cache for real-time 1-minute arbitrage alerts.
+    Key: f"{strategy}|{target}"
+    Rules:
+    - New opportunity: Alert immediately.
+    - Existing opportunity within cooldown window (15 minutes / 900s):
+      - Alert immediately if net profit improves by >= +0.20 pts.
+      - Otherwise, suppress to prevent spamming.
+    - If elapsed >= 15 minutes: Reset cooldown and alert.
+    """
+    def __init__(self, cooldown_seconds: int = 900, profit_hurdle_pts: float = 0.20):
+        self.cooldown_seconds = cooldown_seconds
+        self.profit_hurdle_pts = profit_hurdle_pts
+        self.cache: Dict[str, Dict[str, Any]] = {}
+
+    def filter_alertable(self, opps: List[Dict[str, Any]], now_dt: datetime.datetime) -> List[Dict[str, Any]]:
+        alertable = []
+        for opp in opps:
+            key = f"{opp['strategy']}|{opp['target']}"
+            net_pts = opp["net_pts"]
+
+            if key not in self.cache:
+                alertable.append(opp)
+                self.cache[key] = {
+                    "last_alerted_at": now_dt,
+                    "last_net_pts": net_pts,
+                    "alert_count": 1
+                }
+            else:
+                entry = self.cache[key]
+                elapsed = (now_dt - entry["last_alerted_at"]).total_seconds()
+                profit_diff = net_pts - entry["last_net_pts"]
+
+                if elapsed >= self.cooldown_seconds:
+                    alertable.append(opp)
+                    self.cache[key]["last_alerted_at"] = now_dt
+                    self.cache[key]["last_net_pts"] = net_pts
+                    self.cache[key]["alert_count"] = entry.get("alert_count", 0) + 1
+                elif profit_diff >= self.profit_hurdle_pts:
+                    opp["stats"] = f"Profit Spike: +{profit_diff:.2f} pts vs previous alert"
+                    alertable.append(opp)
+                    self.cache[key]["last_alerted_at"] = now_dt
+                    self.cache[key]["last_net_pts"] = net_pts
+                    self.cache[key]["alert_count"] = entry.get("alert_count", 0) + 1
+                else:
+                    # Cooldown active; suppress alert
+                    pass
+        return alertable
+
+
+def format_live_1min_alert(
     trade_date: str,
-    window_start: str,
-    window_end: str,
+    bar_ts: str,
     profitable_opps: List[Dict[str, Any]],
     thor_rate: float,
     dte: int,
-    T_years: float,
-    dropped_invalid_quotes: int,
-    calc_error_count: int,
-    valid_minutes: int
+    T_years: float
 ) -> str:
-    """Formats 15-minute real-time alert for Telegram (only when net profit > 0)."""
+    """Formats instant real-time Telegram alert for 1-minute detected arbitrage opportunities."""
     header = (
-        f"🚨 <b>[15-MIN ARB ALERT] พบโอกาส Arbitrage ระหว่างวัน!</b>\n"
-        f"📅 <i>ข้อมูลวันที่ {trade_date} | สแกนช่วง {window_start}–{window_end} น.</i>\n"
+        f"🚨 <b>[LIVE 1-MIN ARB] โอกาสเคาะทำกำไรทันที!</b>\n"
+        f"📅 <i>ข้อมูลวันที่ {trade_date} | เวลา <code>{bar_ts}</code></i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -761,19 +808,15 @@ def format_15min_pulse_alert(
     calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
 
     meta_stats = (
-        f"• <b>บาร์ข้อมูลที่ประมวลผล:</b> {valid_minutes} นาที\n"
-        f"• <b>กรองข้อมูลไม่สมบูรณ์:</b> {dropped_invalid_quotes:,} รายการ\n"
-        f"• <b>อัตราดอกเบี้ย THOR:</b> {thor_rate*100.0:.2f}% | <b>DTE:</b> {dte} วัน"
+        f"• <b>อัตราดอกเบี้ย THOR:</b> {thor_rate*100.0:.2f}% | <b>DTE:</b> {dte} วัน\n"
+        f"• <b>ตรวจพบ:</b> {len(profitable_opps)} รายการ (Parity: {parity_cnt}, Vertical: {vertical_cnt}, Calendar: {calendar_cnt})"
     )
 
     summary_sec = (
-        f"🎯 <b>สรุปโอกาสที่พบ ({len(profitable_opps)} ครั้ง ใน 15 นาทีล่าสุด):</b>\n"
-        f"• <b>Put-Call Parity (Black-76):</b> {parity_cnt} ครั้ง\n"
-        f"• <b>Vertical Spread:</b> {vertical_cnt} ครั้ง\n"
-        f"• <b>Calendar Spread Spike:</b> {calendar_cnt} ครั้ง\n"
+        f"⚡ <b>พบสัญญาณเคาะกำไรสุทธิ (Real-time Execution):</b>\n"
         f"{meta_stats}\n"
         f"───────────────────────\n"
-        f"🏆 <b>โอกาสกำไรสุทธิสูงสุด:</b>\n"
+        f"🏆 <b>โอกาสทำกำไรสูงสุด (Strict Bid/Ask):</b>\n"
     )
 
     medals = ["🥇 [1]", "🥈 [2]", "🥉 [3]"]
@@ -791,8 +834,8 @@ def format_15min_pulse_alert(
         block = (
             f"{medal} <b>{opp['strategy']} | {opp['target']} {opp.get('tag', '')}</b>\n"
             f"  • <b>เวลาที่เกิด:</b> <code>{opp['time']}</code>\n"
-            f"  • <b>ขาการเทรด (Strict Bid/Ask):</b>\n{legs_str}\n"
-            f"  • <b>ปริมาณที่เปิดได้ (Executable):</b> <b>{m_sets}</b> ชุด (min leg vol){stats_line}\n"
+            f"  • <b>ขาการเทรด (เคาะทันที):</b>\n{legs_str}\n"
+            f"  • <b>ปริมาณที่เปิดได้ทันที:</b> <b>{m_sets}</b> ชุด (min leg vol){stats_line}\n"
             f"  • <b>กำไรสุทธิต่อชุด:</b> 🟢 <b>+{net_pts:.2f} จุด</b> (+{net_thb_per_set:,.0f} บาท/ชุด)\n"
             f"  • <b>มูลค่ากำไรรวม:</b> <b>+{tot_thb:,.0f} บาท</b> (หักค่าคอม {opp['commission_pts']:.2f} จุดแล้ว)"
         )
@@ -801,7 +844,7 @@ def format_15min_pulse_alert(
     content = summary_sec + "\n\n".join(opp_blocks)
     footer = (
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <i>TFEX Arbitrage Real-time Pulse | แจ้งเตือนเฉพาะเมื่อพบ Net Profit > 0</i>"
+        f"⚡ <i>TFEX Live 1-Min Radar | Smart Cooldown 15 นาทีต่อคู่สัญญา</i>"
     )
 
     return f"{header}\n\n{content}\n\n{footer}"
@@ -911,32 +954,13 @@ def format_telegram_report(
 # 7. WORKER LOOP & DISPATCH CONTROLLER
 # ==============================================================================
 
-def get_next_pulse_time(now_dt: datetime.datetime, min_start: datetime.time) -> datetime.datetime:
-    """Computes next target pulse time at :00, :15, :30, :45 (+10 seconds offset)."""
-    # If now is before the minimum start time, target the minimum start time
-    min_start_dt = now_dt.replace(
-        hour=min_start.hour,
-        minute=min_start.minute,
-        second=min_start.second,
-        microsecond=0
-    )
-    if now_dt < min_start_dt:
-        return min_start_dt
-
-    for m in [0, 15, 30, 45]:
-        cand = now_dt.replace(minute=m, second=10, microsecond=0)
-        if cand > now_dt:
-            return cand
-    next_hr = now_dt + timedelta(hours=1)
-    return next_hr.replace(minute=0, second=10, microsecond=0)
-
-
 def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_telegram: bool = False) -> None:
     """
-    Persistent Session Worker:
-    - Runs 15-minute pulses (:00, :15, :30, :45 +10s).
-    - Anti-Spam: Alerts only when profitable arb is detected.
-    - End of session: Dispatches comprehensive session summary report.
+    Persistent 1-Minute Real-time Session Worker:
+    - Runs a continuous 1-minute loop synced with Turso (:06 offset / 3s polling).
+    - Immediate Execution Principle: Strict Bid/Ask, volume-matched sets, full round-turn commissions.
+    - Smart Anti-Spam: In-memory cooldown (15 min per key, bypassed on >= +0.20 pts profit spike).
+    - End of session: Dispatches comprehensive session summary report to Telegram.
     """
     now_bkk = datetime.datetime.now(BANGKOK_TZ)
     trade_date = target_date or now_bkk.strftime("%Y-%m-%d")
@@ -962,17 +986,20 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
 
     # Session boundaries
     if session_mode == "MORNING_WORKER":
-        first_pulse_time = time(10, 0, 10)
+        session_start_time = time(9, 45, 0)
         session_end_time = time(12, 35, 0)
         summary_start_str = "09:45:00"
         summary_end_str = "12:35:00"
         summary_title = "สรุปภาพรวมช่วงเช้า (09:45–12:35 น.)"
-    else:  # AFTERNOON_WORKER
-        first_pulse_time = time(14, 30, 10)
+    elif session_mode == "AFTERNOON_WORKER":
+        session_start_time = time(14, 15, 0)
         session_end_time = time(17, 5, 0)
         summary_start_str = "09:45:00"
         summary_end_str = "17:05:00"
         summary_title = "สรุปภาพรวมทั้งวัน (09:45–17:05 น.)"
+    else:
+        print(f"[ERROR] Invalid worker session: '{session_mode}'. Must be MORNING_WORKER or AFTERNOON_WORKER.")
+        sys.exit(1)
 
     # Contract & Rate Validation
     cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
@@ -985,89 +1012,148 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     thor_rate = fetch_thor_rate(pipeline_url, turso_token)
 
     print("=" * 75)
-    print(f"TFEX ARBITRAGE WORKER STARTED: {session_mode}")
+    print(f"TFEX REAL-TIME 1-MIN ARBITRAGE WORKER STARTED: {session_mode}")
     print(f"Date: {trade_date} | Front: {front_series} (DTE: {dte}d) | THOR: {thor_rate*100.0:.2f}%")
-    print(f"First Pulse Target: {first_pulse_time.strftime('%H:%M:%S')} | End Time: {session_end_time.strftime('%H:%M:%S')}")
+    print(f"Trading Hours: {session_start_time.strftime('%H:%M:%S')} – {session_end_time.strftime('%H:%M:%S')}")
     print("=" * 75)
 
+    # Pre-market Standby
+    while datetime.datetime.now(BANGKOK_TZ).time() < session_start_time:
+        now_sb = datetime.datetime.now(BANGKOK_TZ)
+        record_arb_heartbeat(pipeline_url, turso_token, session_mode, now_sb)
+        target_start_dt = now_sb.replace(
+            hour=session_start_time.hour,
+            minute=session_start_time.minute,
+            second=session_start_time.second,
+            microsecond=0
+        )
+        wait_sec = (target_start_dt - now_sb).total_seconds()
+        sleep_dur = min(15.0, max(1.0, wait_sec))
+        print(f"[WORKER] Pre-market standby until {session_start_time.strftime('%H:%M:%S')} ({wait_sec:.0f}s remaining)...")
+        pytime.sleep(sleep_dur)
+
+    # Initial session dataset backfill
+    curr_now = datetime.datetime.now(BANGKOK_TZ)
+    curr_time_str = curr_now.strftime("%H:%M:%S")
+    print(f"[WORKER] Initializing session dataset ({summary_start_str} to {curr_time_str})...")
+    session_dataset, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        trade_date=trade_date,
+        start_time_bkk=summary_start_str,
+        end_time_bkk=curr_time_str
+    )
+    last_scanned_ts = max(session_dataset.keys()) if session_dataset else None
+    print(f"[WORKER] Initial dataset ready: {len(session_dataset)} bars loaded. Last bar: {last_scanned_ts}")
+
+    # Initialize Smart Anti-Spam Cooldown
+    cooldown = ArbSmartCooldown(cooldown_seconds=900, profit_hurdle_pts=0.20)
+    last_heartbeat_time = pytime.time()
+
     # --------------------------------------------------------------------------
-    # 15-Minute Pulse Loop
+    # Real-time 1-Minute Live Loop
     # --------------------------------------------------------------------------
+    bound_start = f"{trade_date} {summary_start_str}"
+    bound_end = f"{trade_date} {summary_end_str}"
+    sql_check = "SELECT MAX(captured_at_bkk) FROM futures_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?;"
+    sql_opt_check = "SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk = ?;"
+
     while True:
         curr_bkk = datetime.datetime.now(BANGKOK_TZ)
         if curr_bkk.time() >= session_end_time:
             print(f"[WORKER] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Commencing session summary...")
             break
 
-        next_pulse = get_next_pulse_time(curr_bkk, first_pulse_time)
-        if next_pulse.time() >= session_end_time:
-            # Sleep until session end time for final summary
-            target_end_dt = curr_bkk.replace(
-                hour=session_end_time.hour,
-                minute=session_end_time.minute,
-                second=session_end_time.second,
-                microsecond=0
-            )
-            sleep_sec = (target_end_dt - curr_bkk).total_seconds()
-            if sleep_sec > 0:
-                print(f"[WORKER] Standby for session end at {session_end_time.strftime('%H:%M:%S')} ({sleep_sec:.0f}s)...")
-                pytime.sleep(sleep_sec)
-            break
+        # Record heartbeat periodically every ~60 seconds
+        if pytime.time() - last_heartbeat_time >= 60:
+            record_arb_heartbeat(pipeline_url, turso_token, session_mode, curr_bkk)
+            last_heartbeat_time = pytime.time()
 
-        sleep_sec = (next_pulse - curr_bkk).total_seconds()
-        print(f"[WORKER] Next 15-min pulse at {next_pulse.strftime('%H:%M:%S')} (sleeping {sleep_sec:.0f}s)...")
-        if sleep_sec > 0:
+        # In each minute, wait until second :06
+        curr_sec = curr_bkk.second
+        if curr_sec < 6:
+            sleep_sec = 6 - curr_sec
             pytime.sleep(sleep_sec)
+            curr_bkk = datetime.datetime.now(BANGKOK_TZ)
 
-        # Pulse Execution
-        pulse_now = datetime.datetime.now(BANGKOK_TZ)
-        record_arb_heartbeat(pipeline_url, turso_token, session_mode, pulse_now)
+        # Polling for newly written 1-minute bar in Turso (check MAX captured_at_bkk every 3s up to second :52)
+        new_ts_found = None
+        while curr_bkk.time() < session_end_time and curr_bkk.second <= 52:
+            try:
+                _, check_rows = execute_turso_sql(pipeline_url, turso_token, sql_check, [bound_start, bound_end])
+                turso_max_ts = str(check_rows[0][0]) if check_rows and check_rows[0][0] else None
+            except Exception as e:
+                print(f"[POLL] Error checking Turso max timestamp: {e}")
+                turso_max_ts = None
 
-        w_start = (pulse_now - timedelta(minutes=15)).strftime("%H:%M:00")
-        w_end = pulse_now.strftime("%H:%M:00")
-        print(f"\n--- [15-MIN PULSE] Scanning window: {w_start} – {w_end} ---")
+            if turso_max_ts and (last_scanned_ts is None or turso_max_ts > last_scanned_ts):
+                # Verify options_snapshots also has data for turso_max_ts
+                try:
+                    _, opt_check_rows = execute_turso_sql(pipeline_url, turso_token, sql_opt_check, [turso_max_ts])
+                    opt_bar_cnt = int(opt_check_rows[0][0]) if opt_check_rows and opt_check_rows[0][0] else 0
+                except Exception as e:
+                    print(f"[POLL] Error checking options count for {turso_max_ts}: {e}")
+                    opt_bar_cnt = 0
 
-        grouped_data, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
-            pipeline_url=pipeline_url,
-            auth_token=turso_token,
-            trade_date=trade_date,
-            start_time_bkk=w_start,
-            end_time_bkk=w_end
-        )
+                if opt_bar_cnt > 0:
+                    new_ts_found = turso_max_ts
+                    break
 
-        if not grouped_data:
-            print(f"[PULSE] No synchronized data found in window {w_start}–{w_end}. Skipping pulse.")
-            continue
+            # If not yet written to Turso, wait 3 seconds and retry
+            pytime.sleep(3)
+            curr_bkk = datetime.datetime.now(BANGKOK_TZ)
 
-        p_opps, _, d1, e1 = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
-        v_opps, _, d2, e2 = scan_vertical_spreads(grouped_data, front_series)
-        c_opps, _, d3, e3 = scan_calendar_spreads(grouped_data, front_series, next_series)
-
-        pulse_opps = p_opps + v_opps + c_opps
-        tot_drop = d1 + d2 + d3
-        tot_err = e1 + e2 + e3
-
-        print(f"[PULSE] Found {len(pulse_opps)} profitable opportunities (Parity={len(p_opps)}, Vert={len(v_opps)}, Cal={len(c_opps)}).")
-
-        # Anti-Spam: Dispatch ONLY if profitable opportunities exist
-        if pulse_opps:
-            print(f"[TELEGRAM] Profitable opportunities detected! Dispatching 15-min alert...")
-            pulse_msg = format_15min_pulse_alert(
+        if new_ts_found:
+            bar_time_str = new_ts_found[11:19]
+            # Fetch newly arrived bar
+            new_data, _, _ = fetch_intraday_arb_dataset(
+                pipeline_url=pipeline_url,
+                auth_token=turso_token,
                 trade_date=trade_date,
-                window_start=w_start[:5],
-                window_end=w_end[:5],
-                profitable_opps=pulse_opps,
-                thor_rate=thor_rate,
-                dte=dte,
-                T_years=T_years,
-                dropped_invalid_quotes=tot_drop,
-                calc_error_count=tot_err,
-                valid_minutes=len(grouped_data)
+                start_time_bkk=bar_time_str,
+                end_time_bkk=bar_time_str
             )
-            if not no_telegram and tg_token and tg_chat_id:
-                send_telegram_alert(tg_token, tg_chat_id, pulse_msg)
+            session_dataset.update(new_data)
+            last_scanned_ts = new_ts_found
+
+            if new_ts_found in session_dataset:
+                single_bar = {new_ts_found: session_dataset[new_ts_found]}
+                p_opps, _, d1, e1 = scan_put_call_parity(single_bar, front_series, thor_rate, T_years)
+                v_opps, _, d2, e2 = scan_vertical_spreads(single_bar, front_series)
+                # Calendar spreads use rolling session_dataset, filtered by current bar timestamp
+                c_opps, _, d3, e3 = scan_calendar_spreads(session_dataset, front_series, next_series)
+                c_curr = [c for c in c_opps if c.get("time") == new_ts_found]
+
+                bar_all_opps = p_opps + v_opps + c_curr
+                print(f"[{bar_time_str}] 1-Min Bar Scanned. Found {len(bar_all_opps)} profitable opps (Parity={len(p_opps)}, Vert={len(v_opps)}, Cal={len(c_curr)}).")
+
+                if bar_all_opps:
+                    alertable = cooldown.filter_alertable(bar_all_opps, curr_bkk)
+                    if alertable:
+                        print(f"[TELEGRAM] 🚨 Dispatching LIVE 1-Min Alert for {len(alertable)} opportunities...")
+                        live_msg = format_live_1min_alert(
+                            trade_date=trade_date,
+                            bar_ts=bar_time_str,
+                            profitable_opps=alertable,
+                            thor_rate=thor_rate,
+                            dte=dte,
+                            T_years=T_years
+                        )
+                        if not no_telegram and tg_token and tg_chat_id:
+                            send_telegram_alert(tg_token, tg_chat_id, live_msg)
+                    else:
+                        print(f"[COOLDOWN] {len(bar_all_opps)} opps detected but held in anti-spam cooldown.")
         else:
-            print(f"[PULSE] ({w_start}–{w_end}) No profitable opportunities. Anti-spam: Telegram alert skipped.")
+            print(f"[{curr_bkk.strftime('%H:%M:%S')}] No new bar detected during minute window.")
+
+        # Standby until next minute's second :06
+        now_post = datetime.datetime.now(BANGKOK_TZ)
+        if now_post.time() >= session_end_time:
+            break
+        sec_to_next = 60 - now_post.second + 6
+        if sec_to_next > 60:
+            sec_to_next -= 60
+        pytime.sleep(max(1.0, sec_to_next))
 
     # --------------------------------------------------------------------------
     # Final Session Summary Execution
