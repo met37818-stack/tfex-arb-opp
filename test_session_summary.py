@@ -17,7 +17,8 @@ from arb_scanner import (
     compute_best_of_minute_stats,
     format_telegram_report,
     COMMISSION_3LEG_PTS,
-    COMMISSION_2LEG_PTS
+    COMMISSION_2LEG_PTS,
+    select_dynamic_thor_rate
 )
 
 
@@ -337,10 +338,55 @@ def test_zero_traded_volume_with_valid_quotes():
     print("✅ Zero Traded Volume with Valid Bids/Asks Correctly Evaluated (Not Dropped)!")
 
 
+def test_dynamic_thor_rate_selection():
+    """Verifies Tenor-Matching logic for dynamic THOR rates across DTE horizons."""
+    thor_record = {
+        "overnight": 0.99479,
+        "1m": 0.99447,
+        "3m": 0.99564,
+        "6m": 0.99600
+    }
+
+    # 1. DTE <= 30 -> 1M
+    r1, label1 = select_dynamic_thor_rate(thor_record, dte=15)
+    assert label1 == "1M"
+    assert math.isclose(r1, 0.0099447, abs_tol=1e-7)
+
+    # 2. 30 < DTE <= 90 -> 3M
+    r2, label2 = select_dynamic_thor_rate(thor_record, dte=42)
+    assert label2 == "3M"
+    assert math.isclose(r2, 0.0099564, abs_tol=1e-7)
+
+    # 3. 90 < DTE <= 180 -> 6M
+    r3, label3 = select_dynamic_thor_rate(thor_record, dte=120)
+    assert label3 == "6M"
+    assert math.isclose(r3, 0.0099600, abs_tol=1e-7)
+
+    # 4. DTE > 180 -> 6M
+    r4, label4 = select_dynamic_thor_rate(thor_record, dte=250)
+    assert label4 == "6M"
+    assert math.isclose(r4, 0.0099600, abs_tol=1e-7)
+
+    # 5. Fallback test: when 3M is missing for DTE=42, fall back to 1M
+    partial_rec = {"overnight": 0.99479, "1m": 0.99447, "3m": None, "6m": 0.99600}
+    r_fb, label_fb = select_dynamic_thor_rate(partial_rec, dte=42)
+    assert label_fb == "1M"
+    assert math.isclose(r_fb, 0.0099447, abs_tol=1e-7)
+
+    # 6. Fallback test: when all averages missing, fall back to Overnight
+    on_only_rec = {"overnight": 0.99479, "1m": None, "3m": None, "6m": None}
+    r_on, label_on = select_dynamic_thor_rate(on_only_rec, dte=42)
+    assert label_on == "ON"
+    assert math.isclose(r_on, 0.0099479, abs_tol=1e-7)
+
+    print("✅ Dynamic THOR Rate Tenor Matching & Fallbacks Verified!")
+
+
 if __name__ == "__main__":
     test_scan_and_friction_breakdown()
     test_best_of_minute_stats()
     test_telegram_message_formatting_and_length()
     test_telegram_message_no_profitable_opps()
     test_zero_traded_volume_with_valid_quotes()
+    test_dynamic_thor_rate_selection()
     print("\n🎉 ALL UNIT TESTS PASSED SUCCESSFULLY!")

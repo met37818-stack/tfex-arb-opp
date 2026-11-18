@@ -236,17 +236,77 @@ def parse_series_expiry(series_code: str, ref_date: date) -> datetime.datetime:
 # 4. TURSO INTRADAY DATASET LOADER (STRICT VALIDATION)
 # ==============================================================================
 
-def fetch_thor_rate(pipeline_url: str, auth_token: str) -> float:
-    sql_thor = "SELECT thor_rate FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"
+def select_dynamic_thor_rate(
+    thor_record: Dict[str, Optional[float]],
+    dte: int
+) -> Tuple[float, str]:
+    """
+    Selects the dynamic THOR rate matching the option's DTE (Days to Expiration).
+    
+    Tenor Selection Rules:
+    - dte <= 30 days:
+        Prefer 1M Compounded ('1m')
+        Fallback: Overnight ('overnight')
+    - 30 < dte <= 90 days:
+        Prefer 3M Compounded ('3m')
+        Fallback: 1M Compounded ('1m') -> Overnight ('overnight')
+    - 90 < dte <= 180 days:
+        Prefer 6M Compounded ('6m')
+        Fallback: 3M Compounded ('3m') -> 1M Compounded -> Overnight
+    - dte > 180 days:
+        Prefer 6M Compounded ('6m')
+        Fallback: 3M Compounded -> Overnight
+        
+    Returns:
+        (rate_decimal, tenor_label) where rate_decimal is in decimal form (e.g. 0.00995)
+    """
+    def _clean(val: Optional[float]) -> Optional[float]:
+        if val is None or val <= 0:
+            return None
+        return val / 100.0 if val > 0.5 else val
+
+    r_on = _clean(thor_record.get("overnight"))
+    r_1m = _clean(thor_record.get("1m"))
+    r_3m = _clean(thor_record.get("3m"))
+    r_6m = _clean(thor_record.get("6m"))
+
+    if dte <= 30:
+        candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
+    elif dte <= 90:
+        candidates = [("3M", r_3m), ("1M", r_1m), ("ON", r_on), ("6M", r_6m)]
+    elif dte <= 180:
+        candidates = [("6M", r_6m), ("3M", r_3m), ("1M", r_1m), ("ON", r_on)]
+    else:
+        candidates = [("6M", r_6m), ("3M", r_3m), ("ON", r_on), ("1M", r_1m)]
+
+    for label, rate in candidates:
+        if rate is not None and rate > 0:
+            return rate, label
+
+    raise ValueError(f"No valid THOR rate found in record: {thor_record}")
+
+
+def fetch_thor_rates_record(pipeline_url: str, auth_token: str) -> Dict[str, Optional[float]]:
+    sql_thor = "SELECT thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"
     _, rows_thor = execute_turso_sql(pipeline_url, auth_token, sql_thor)
     if not rows_thor or rows_thor[0][0] is None:
         raise ValueError("No record found in eod_thor_rates table or value is NULL.")
     
-    val = float(rows_thor[0][0])
-    if val <= 0:
-        raise ValueError(f"Invalid THOR rate in eod_thor_rates: {val} (must be > 0)")
-    
-    rate = val / 100.0 if val > 0.5 else val
+    row = rows_thor[0]
+    return {
+        "overnight": float(row[0]) if len(row) > 0 and row[0] is not None else None,
+        "1m": float(row[1]) if len(row) > 1 and row[1] is not None else None,
+        "3m": float(row[2]) if len(row) > 2 and row[2] is not None else None,
+        "6m": float(row[3]) if len(row) > 3 and row[3] is not None else None,
+    }
+
+
+def fetch_thor_rate(pipeline_url: str, auth_token: str, dte: Optional[int] = None) -> float:
+    thor_rec = fetch_thor_rates_record(pipeline_url, auth_token)
+    if dte is not None:
+        rate, _ = select_dynamic_thor_rate(thor_rec, dte)
+        return rate
+    rate, _ = select_dynamic_thor_rate(thor_rec, 42)
     return rate
 
 
@@ -869,7 +929,8 @@ def format_live_1min_alert(
     profitable_opps: List[Dict[str, Any]],
     thor_rate: float,
     dte: int,
-    T_years: float
+    T_years: float,
+    thor_tenor: str = ""
 ) -> str:
     """Formats instant real-time Telegram alert for 1-minute detected arbitrage opportunities with complete execution details."""
     header = (
@@ -885,8 +946,9 @@ def format_live_1min_alert(
     vertical_cnt = sum(1 for x in profitable_opps if "Monotonicity" in x["strategy"])
     calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
 
+    tenor_str = f" ({thor_tenor})" if thor_tenor else ""
     meta_stats = (
-        f"• <b>อัตราดอกเบี้ย THOR:</b> {thor_rate*100.0:.2f}% | <b>DTE คงเหลือ:</b> {dte} วัน\n"
+        f"• <b>อัตราดอกเบี้ย THOR{tenor_str}:</b> {thor_rate*100.0:.2f}% | <b>DTE คงเหลือ:</b> {dte} วัน\n"
         f"• <b>ตรวจพบ:</b> {len(profitable_opps)} รายการ (Parity: {parity_cnt}, Vertical: {vertical_cnt}, Calendar: {calendar_cnt})"
     )
 
@@ -1003,7 +1065,8 @@ def format_telegram_report(
     calc_error_count: int,
     valid_minutes: int,
     minute_stats: Optional[Dict[str, Any]] = None,
-    strategy_nears: Optional[Dict[str, Any]] = None
+    strategy_nears: Optional[Dict[str, Any]] = None,
+    thor_tenor: str = ""
 ) -> str:
     """Formats full session summary report for Telegram with market tightness stats and friction breakdown."""
     header = (
@@ -1141,10 +1204,11 @@ def format_telegram_report(
         )
 
     # Data Audit (Condensed into 2 lines)
+    tenor_str = f" ({thor_tenor})" if thor_tenor else ""
     audit_sec = (
         f"───────────────────────\n"
         f"🔍 <b>Data Audit:</b> ประมวลผล <code>{valid_minutes}</code> บาร์ | กรอง Bid/Ask ผิดปกติ: <code>{dropped_invalid_quotes:,}</code> | Error: <code>{calc_error_count}</code>\n"
-        f"📌 <b>ตัวแปรอ้างอิง:</b> THOR <code>{thor_rate*100.0:.2f}%</code> | DTE <code>{dte} วัน</code> (T = {T_years:.4f} ปี) | คอม 40 บ./สัญญา/ขา"
+        f"📌 <b>ตัวแปรอ้างอิง:</b> THOR{tenor_str} <code>{thor_rate*100.0:.2f}%</code> | DTE <code>{dte} วัน</code> (T = {T_years:.4f} ปี) | คอม 40 บ./สัญญา/ขา"
     )
 
     footer = (
@@ -1224,11 +1288,12 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         print(f"[ERROR] Invalid DTE ({dte} days) for series {front_series}. Exiting.")
         sys.exit(1)
     T_years = dte / 365.0
-    thor_rate = fetch_thor_rate(pipeline_url, turso_token)
+    thor_record = fetch_thor_rates_record(pipeline_url, turso_token)
+    thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
     print("=" * 75)
     print(f"TFEX REAL-TIME 1-MIN ARBITRAGE WORKER STARTED: {session_mode}")
-    print(f"Date: {trade_date} | Front: {front_series} (DTE: {dte}d) | THOR: {thor_rate*100.0:.2f}%")
+    print(f"Date: {trade_date} | Front: {front_series} (DTE: {dte}d) | THOR ({thor_tenor}): {thor_rate*100.0:.2f}%")
     print(f"Trading Hours: {session_start_time.strftime('%H:%M:%S')} – {session_end_time.strftime('%H:%M:%S')}")
     print("=" * 75)
 
@@ -1352,7 +1417,8 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                             profitable_opps=alertable,
                             thor_rate=thor_rate,
                             dte=dte,
-                            T_years=T_years
+                            T_years=T_years,
+                            thor_tenor=thor_tenor
                         )
                         if not no_telegram and tg_token and tg_chat_id:
                             send_telegram_alert(tg_token, tg_chat_id, live_msg)
@@ -1430,7 +1496,8 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         calc_error_count=(e1 + e2 + e3),
         valid_minutes=len(grouped_data),
         minute_stats=minute_stats,
-        strategy_nears=strategy_nears
+        strategy_nears=strategy_nears,
+        thor_tenor=thor_tenor
     )
 
     print("\n" + "=" * 75)
@@ -1485,7 +1552,8 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         print(f"[ERROR] Invalid DTE ({dte} days) for series {front_series}. Exiting.")
         sys.exit(1)
     T_years = dte / 365.0
-    thor_rate = fetch_thor_rate(pipeline_url, turso_token)
+    thor_record = fetch_thor_rates_record(pipeline_url, turso_token)
+    thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
     grouped_data, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
         pipeline_url=pipeline_url,
@@ -1540,7 +1608,8 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         calc_error_count=(e1 + e2 + e3),
         valid_minutes=len(grouped_data),
         minute_stats=minute_stats,
-        strategy_nears=strategy_nears
+        strategy_nears=strategy_nears,
+        thor_tenor=thor_tenor
     )
 
     print("\n" + "=" * 75)
