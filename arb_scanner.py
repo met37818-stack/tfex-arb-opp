@@ -1470,6 +1470,10 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
     )
 
     print(f"[DEBUG] Rows in options_snapshots: {opt_cnt}, Futures: {fut_cnt}, Grouped minutes: {len(grouped_data)}")
+    _, r_fut_stats = execute_turso_sql(pipeline_url, turso_token, f"SELECT COUNT(*), COUNT(bid), COUNT(ask) FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';")
+    _, r_opt_stats = execute_turso_sql(pipeline_url, turso_token, f"SELECT COUNT(*), COUNT(bid), COUNT(ask) FROM options_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';")
+    print(f"[DEBUG] DB Stats Futures: {r_fut_stats}")
+    print(f"[DEBUG] DB Stats Options: {r_opt_stats}")
     if grouped_data:
         first_ts = list(grouped_data.keys())[0]
         print(f"[DEBUG] First ts: {first_ts}")
