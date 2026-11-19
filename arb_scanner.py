@@ -1053,6 +1053,91 @@ class ArbSmartCooldown:
         return alertable
 
 
+class OpportunityLifespanTracker:
+    """
+    In-memory tick-to-tick lifespan duration tracker for arbitrage opportunities.
+    Key: f"{strategy}|{target}"
+    Tracks duration in seconds from first_seen_ts until opportunity closes or session ends.
+    """
+    def __init__(self):
+        self.active_opportunities: Dict[str, Dict[str, datetime.datetime]] = {}
+        self.closed_durations: List[float] = []
+
+    def _parse_ts(self, ts_val: Any) -> datetime.datetime:
+        if isinstance(ts_val, datetime.datetime):
+            return ts_val
+        s = str(ts_val).strip()
+        if len(s) >= 19 and (" " in s or "T" in s):
+            s_clean = s[:19].replace("T", " ")
+            try:
+                return datetime.datetime.strptime(s_clean, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        elif len(s) == 8 and s.count(":") == 2:
+            try:
+                today = datetime.date.today()
+                t = datetime.datetime.strptime(s, "%H:%M:%S").time()
+                return datetime.datetime.combine(today, t)
+            except Exception:
+                pass
+        return datetime.datetime.now(BANGKOK_TZ).replace(tzinfo=None)
+
+    def update(self, current_profitable_opps: List[Dict[str, Any]], current_ts: Any) -> None:
+        curr_dt = self._parse_ts(current_ts)
+        seen_keys = set()
+
+        for opp in current_profitable_opps:
+            if opp.get("net_pts", 0.0) > 0:
+                key = f"{opp['strategy']}|{opp['target']}"
+                seen_keys.add(key)
+                if key not in self.active_opportunities:
+                    self.active_opportunities[key] = {
+                        "first_seen_ts": curr_dt,
+                        "last_seen_ts": curr_dt
+                    }
+                else:
+                    self.active_opportunities[key]["last_seen_ts"] = curr_dt
+
+        # Check for opportunities that disappeared / closed
+        closed_keys = [k for k in self.active_opportunities if k not in seen_keys]
+        for k in closed_keys:
+            entry = self.active_opportunities.pop(k)
+            first_ts = entry["first_seen_ts"]
+            last_ts = entry["last_seen_ts"]
+            dur = max(1.0, (last_ts - first_ts).total_seconds())
+            self.closed_durations.append(dur)
+
+    def finalize(self, end_ts: Any = None) -> None:
+        """Closes all remaining active opportunities at session end."""
+        end_dt = self._parse_ts(end_ts) if end_ts else None
+        for k, entry in list(self.active_opportunities.items()):
+            first_ts = entry["first_seen_ts"]
+            last_ts = end_dt if end_dt else entry["last_seen_ts"]
+            if last_ts < first_ts:
+                last_ts = first_ts
+            dur = max(1.0, (last_ts - first_ts).total_seconds())
+            self.closed_durations.append(dur)
+        self.active_opportunities.clear()
+
+    def get_stats(self) -> Dict[str, Any]:
+        if not self.closed_durations:
+            return {
+                "has_data": False,
+                "count": 0,
+                "avg_sec": 0.0,
+                "min_sec": 0.0,
+                "max_sec": 0.0
+            }
+        arr = self.closed_durations
+        return {
+            "has_data": True,
+            "count": len(arr),
+            "avg_sec": float(sum(arr) / len(arr)),
+            "min_sec": float(min(arr)),
+            "max_sec": float(max(arr))
+        }
+
+
 def format_action_leg(leg: str) -> str:
     """
     Parses leg description and formats with high-visibility actionable color tags:
@@ -1238,7 +1323,8 @@ def format_telegram_report(
     valid_minutes: int,
     minute_stats: Optional[Dict[str, Any]] = None,
     strategy_nears: Optional[Dict[str, Any]] = None,
-    thor_tenor: str = ""
+    thor_tenor: str = "",
+    lifespan_stats: Optional[Dict[str, Any]] = None
 ) -> str:
     """Formats full session summary report for Telegram with market tightness stats and friction breakdown."""
     header = (
@@ -1255,9 +1341,18 @@ def format_telegram_report(
         vertical_cnt = sum(1 for x in profitable_opps if "Monotonicity" in x["strategy"])
         calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
 
+        lifespan_str = ""
+        if lifespan_stats and lifespan_stats.get("has_data"):
+            l_avg = lifespan_stats["avg_sec"]
+            l_min = lifespan_stats["min_sec"]
+            l_max = lifespan_stats["max_sec"]
+            l_cnt = lifespan_stats["count"]
+            lifespan_str = f"• ⏱ <b>อายุโอกาสทำกำไร (Lifespan):</b> เฉลี่ย {l_avg:.0f} วิ | สั้นสุด {l_min:.0f} วิ | นานสุด {l_max:.0f} วิ (จาก {l_cnt} รอบที่เกิด)\n"
+
         summary_sec = (
             f"🎯 <b>พบโอกาส Arbitrage กำไรสุทธิ ({len(profitable_opps)} ครั้ง):</b>\n"
-            f"• <b>Put-Call Parity:</b> {parity_cnt} ครั้ง | <b>Vertical:</b> {vertical_cnt} ครั้ง | <b>Calendar:</b> {calendar_cnt} ครั้ง\n\n"
+            f"• <b>Put-Call Parity:</b> {parity_cnt} ครั้ง | <b>Vertical:</b> {vertical_cnt} ครั้ง | <b>Calendar:</b> {calendar_cnt} ครั้ง\n"
+            f"{lifespan_str}\n"
             f"🏆 <b>TOP {len(top_3)} โอกาสกำไรสูงสุด:</b>"
         )
 
@@ -1509,8 +1604,9 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         running_futures = {}
         running_options = {}
 
-    # Initialize Smart Anti-Spam Cooldown
+    # Initialize Smart Anti-Spam Cooldown & Lifespan Tracker
     cooldown = ArbSmartCooldown(cooldown_seconds=900, profit_hurdle_pts=0.20)
+    lifespan_tracker = OpportunityLifespanTracker()
     last_heartbeat_time = pytime.time()
 
     # --------------------------------------------------------------------------
@@ -1674,6 +1770,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
             c_curr = [c for c in c_opps if c.get("time") == new_ts_found]
 
             bar_all_opps = p_opps + v_opps + c_curr
+            lifespan_tracker.update(bar_all_opps, new_ts_found)
             bar_time_str = new_ts_found[11:19]
             print(f"[{bar_time_str}] Event Scanned ({new_ts_found}). Found {len(bar_all_opps)} profitable opps (Parity={len(p_opps)}, Vert={len(v_opps)}, Cal={len(c_curr)}).")
 
@@ -1700,6 +1797,10 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
 
         # Event-driven polling interval: 5 seconds
         pytime.sleep(5)
+
+    # Finalize any ongoing opportunities in tracker
+    lifespan_tracker.finalize(datetime.datetime.now(BANGKOK_TZ))
+    lifespan_stats = lifespan_tracker.get_stats()
 
     # --------------------------------------------------------------------------
     # Final Session Summary Execution
@@ -1762,7 +1863,8 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         valid_minutes=len(grouped_data),
         minute_stats=minute_stats,
         strategy_nears=strategy_nears,
-        thor_tenor=thor_tenor
+        thor_tenor=thor_tenor,
+        lifespan_stats=lifespan_stats
     )
 
     print("\n" + "=" * 75)
@@ -1874,7 +1976,8 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         valid_minutes=len(grouped_data),
         minute_stats=minute_stats,
         strategy_nears=strategy_nears,
-        thor_tenor=thor_tenor
+        thor_tenor=thor_tenor,
+        lifespan_stats=None
     )
 
     print("\n" + "=" * 75)

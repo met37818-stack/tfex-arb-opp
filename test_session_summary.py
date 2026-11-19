@@ -19,7 +19,8 @@ from arb_scanner import (
     COMMISSION_3LEG_PTS,
     COMMISSION_2LEG_PTS,
     select_dynamic_thor_rate,
-    is_executable_market_hours
+    is_executable_market_hours,
+    OpportunityLifespanTracker
 )
 
 
@@ -455,6 +456,116 @@ def test_sub_minute_coalescing_in_best_of_minute_stats():
     assert math.isclose(stats["avg"], 1.95, abs_tol=1e-7)
 
     print("✅ Sub-Minute Timestamp Coalescing to 1-Minute Buckets Verified!")
+
+
+def test_opportunity_lifespan_tracker():
+    """Verifies Tick-to-Tick Opportunity Lifespan Tracker (first_seen, last_seen, duration, finalize)."""
+    import datetime
+    tracker = OpportunityLifespanTracker()
+
+    # Initial state
+    stats0 = tracker.get_stats()
+    assert stats0["has_data"] is False
+    assert stats0["count"] == 0
+
+    # Tick 1: 10:00:00 - Opp A arrives
+    opp_a = {"strategy": "Conversion", "target": "Strike 920 & S50Z26", "net_pts": 0.50}
+    tracker.update([opp_a], "2026-11-19 10:00:00")
+    assert len(tracker.active_opportunities) == 1
+    assert len(tracker.closed_durations) == 0
+
+    # Tick 2: 10:00:05 - Opp A still active, Opp B arrives
+    opp_b = {"strategy": "Vertical Call", "target": "Call 900/910", "net_pts": 0.30}
+    tracker.update([opp_a, opp_b], "2026-11-19 10:00:05")
+    assert len(tracker.active_opportunities) == 2
+    assert len(tracker.closed_durations) == 0
+
+    # Tick 3: 10:00:10 - Opp A still active, Opp B disappears (closed)
+    tracker.update([opp_a], "2026-11-19 10:00:10")
+    # Opp B was first seen 10:00:05, last seen 10:00:05 -> duration = max(1.0, 0.0) = 1.0s
+    assert len(tracker.active_opportunities) == 1
+    assert len(tracker.closed_durations) == 1
+    assert tracker.closed_durations[0] == 1.0
+
+    # Tick 4: 10:00:20 - Opp A disappears (closed)
+    # Opp A was first seen 10:00:00, last seen 10:00:10 -> duration = 10.0s
+    tracker.update([], "2026-11-19 10:00:20")
+    assert len(tracker.active_opportunities) == 0
+    assert len(tracker.closed_durations) == 2
+    assert tracker.closed_durations[1] == 10.0
+
+    # Tick 5: 10:01:00 - Opp C arrives, stays active until session end
+    opp_c = {"strategy": "Calendar", "target": "S50Z26/S50H27", "net_pts": 0.70}
+    tracker.update([opp_c], "2026-11-19 10:01:00")
+    assert len(tracker.active_opportunities) == 1
+
+    # Session end at 10:01:45
+    tracker.finalize("2026-11-19 10:01:45")
+    assert len(tracker.active_opportunities) == 0
+    assert len(tracker.closed_durations) == 3
+    # Opp C duration: 10:01:45 - 10:01:00 = 45.0s
+    assert tracker.closed_durations[2] == 45.0
+
+    stats = tracker.get_stats()
+    assert stats["has_data"] is True
+    assert stats["count"] == 3
+    assert math.isclose(stats["min_sec"], 1.0, abs_tol=1e-7)
+    assert math.isclose(stats["max_sec"], 45.0, abs_tol=1e-7)
+    # Average: (1.0 + 10.0 + 45.0) / 3 = 18.666...
+    assert math.isclose(stats["avg_sec"], 56.0 / 3.0, abs_tol=1e-7)
+
+    print(f"✅ Opportunity Lifespan Tracker Verified: Count={stats['count']}, Min={stats['min_sec']:.0f}s, Max={stats['max_sec']:.0f}s, Avg={stats['avg_sec']:.1f}s")
+
+
+def test_telegram_message_with_lifespan():
+    """Verifies that format_telegram_report renders lifespan stats correctly and stays under 3,800 chars."""
+    thor_rate = 0.0225
+    T_years = 42.0 / 365.0
+
+    opp = {
+        "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
+        "target": "Strike 920 & S50Z26",
+        "series": "S50Z26",
+        "strike": 920.0,
+        "time": "10:15:00",
+        "max_sets": 10,
+        "gross_pts": 1.20,
+        "net_pts": 0.60,
+        "mid_edge": 1.80,
+        "spread_cost": 0.60,
+        "commission_pts": 0.60,
+        "legs": [
+            "Sell Call 920 @ Bid <code>12.00</code> (Vol: 20)",
+            "Buy Put 920 @ Ask <code>10.00</code> (Vol: 20)",
+            "Buy Futures S50Z26 @ Ask <code>921.00</code> (Vol: 20)"
+        ]
+    }
+
+    lifespan_stats = {
+        "has_data": True,
+        "count": 5,
+        "avg_sec": 18.4,
+        "min_sec": 3.0,
+        "max_sec": 42.0
+    }
+
+    report = format_telegram_report(
+        session_title="ทดสอบ Lifespan",
+        trade_date="2026-11-19",
+        profitable_opps=[opp],
+        near_miss=opp,
+        thor_rate=thor_rate,
+        dte=42,
+        T_years=T_years,
+        dropped_invalid_quotes=0,
+        calc_error_count=0,
+        valid_minutes=10,
+        lifespan_stats=lifespan_stats
+    )
+
+    assert "⏱ <b>อายุโอกาสทำกำไร (Lifespan):</b> เฉลี่ย 18 วิ | สั้นสุด 3 วิ | นานสุด 42 วิ (จาก 5 รอบที่เกิด)" in report
+    assert len(report) < 3800
+    print("✅ Telegram Report Lifespan Rendering & Character Limit (< 3,800) Verified!")
 
 
 if __name__ == "__main__":
