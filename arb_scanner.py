@@ -416,7 +416,8 @@ def fetch_intraday_arb_dataset(
                     "ask_vol": ask_vol,
                     "last": float(last) if last is not None else None,
                     "volume": float(vol) if vol is not None else 0.0,
-                    "oi": float(oi) if oi is not None else 0.0
+                    "oi": float(oi) if oi is not None else 0.0,
+                    "last_update_ts": str(r[0])
                 }
 
         # Update options (forward-fill unchanged contracts)
@@ -438,8 +439,34 @@ def fetch_intraday_arb_dataset(
                     "ask_vol": ask_vol,
                     "last": float(last) if last is not None else None,
                     "volume": float(vol) if vol is not None else 0.0,
-                    "oi": float(oi) if oi is not None else 0.0
+                    "oi": float(oi) if oi is not None else 0.0,
+                    "last_update_ts": str(r[0])
                 }
+
+        # Strict Staleness Guard: Prune any quote older than 15 minutes (900 seconds)
+        try:
+            m_dt = datetime.datetime.strptime(m_ts[:19], "%Y-%m-%d %H:%M:%S")
+            for sym in list(running_futures.keys()):
+                u_ts = running_futures[sym].get("last_update_ts")
+                if u_ts:
+                    try:
+                        u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
+                        if (m_dt - u_dt).total_seconds() > 900:
+                            del running_futures[sym]
+                    except Exception:
+                        pass
+
+            for key in list(running_options.keys()):
+                u_ts = running_options[key].get("last_update_ts")
+                if u_ts:
+                    try:
+                        u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
+                        if (m_dt - u_dt).total_seconds() > 900:
+                            del running_options[key]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # Snapshot current AS-OF continuous state for this minute
         grouped[m_ts] = {
@@ -523,105 +550,101 @@ def scan_put_call_parity(
             f_bvol = fut.get("bid_vol", 0.0) or 0.0
             f_avol = fut.get("ask_vol", 0.0) or 0.0
 
-            if c_bvol > 0 and p_avol > 0 and f_avol > 0:
-                max_sets_conv = int(min(c_bvol, p_avol, f_avol))
-            else:
-                max_sets_conv = int(min(c_vol, p_vol, f_vol)) if (c_vol > 0 and p_vol > 0 and f_vol > 0) else 1
-
-            if c_avol > 0 and p_bvol > 0 and f_bvol > 0:
-                max_sets_rev = int(min(c_avol, p_bvol, f_bvol))
-            else:
-                max_sets_rev = int(min(c_vol, p_vol, f_vol)) if (c_vol > 0 and p_vol > 0 and f_vol > 0) else 1
-
             liq_tag = "[Liquid: Spot±30]" if abs(k - ref_price) <= 30.0 else "[Deep Strike: ถือจนหมดอายุ]"
 
             # 1. Conversion: (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
-            try:
-                disc_diff_mid = (f_mid - k) * disc_factor
-                mid_edge_conv = (c_mid - p_mid) - disc_diff_mid
+            # Requires strict depth: Sell Call @ Bid, Buy Put @ Ask, Buy Fut @ Ask
+            if c_bvol > 0 and p_avol > 0 and f_avol > 0:
+                max_sets_conv = int(min(c_bvol, p_avol, f_avol))
+                try:
+                    disc_diff_mid = (f_mid - k) * disc_factor
+                    mid_edge_conv = (c_mid - p_mid) - disc_diff_mid
 
-                disc_diff_conv = (f_ask - k) * disc_factor
-                gross_conv = (c_bid - p_ask) - disc_diff_conv
-                if math.isnan(gross_conv) or math.isinf(gross_conv):
+                    disc_diff_conv = (f_ask - k) * disc_factor
+                    gross_conv = (c_bid - p_ask) - disc_diff_conv
+                    if math.isnan(gross_conv) or math.isinf(gross_conv):
+                        calc_error_count += 1
+                        gross_conv = None
+                except Exception:
                     calc_error_count += 1
                     gross_conv = None
-            except Exception:
-                calc_error_count += 1
-                gross_conv = None
 
-            if gross_conv is not None:
-                net_conv = gross_conv - COMMISSION
-                spread_cost_conv = mid_edge_conv - gross_conv
-                item_conv = {
-                    "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
-                    "target": f"Strike {k:.0f} & {fut_sym}",
-                    "tag": liq_tag,
-                    "time": ts,
-                    "series": front_series,
-                    "strike": k,
-                    "gross_pts": gross_conv,
-                    "net_pts": net_conv,
-                    "mid_edge": mid_edge_conv,
-                    "spread_cost": spread_cost_conv,
-                    "commission_pts": COMMISSION,
-                    "max_sets": max_sets_conv,
-                    "legs": [
-                        f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Vol: {c_vol:,.0f})",
-                        f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Vol: {p_vol:,.0f})",
-                        f"Buy Futures {fut_sym} @ Ask <code>{f_ask:.2f}</code> (Vol: {f_vol:,.0f})"
-                    ]
-                }
-                if ts not in minute_bests or net_conv > minute_bests[ts]:
-                    minute_bests[ts] = net_conv
+                if gross_conv is not None:
+                    net_conv = gross_conv - COMMISSION
+                    spread_cost_conv = mid_edge_conv - gross_conv
+                    item_conv = {
+                        "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
+                        "target": f"Strike {k:.0f} & {fut_sym}",
+                        "tag": liq_tag,
+                        "time": ts,
+                        "series": front_series,
+                        "strike": k,
+                        "gross_pts": gross_conv,
+                        "net_pts": net_conv,
+                        "mid_edge": mid_edge_conv,
+                        "spread_cost": spread_cost_conv,
+                        "commission_pts": COMMISSION,
+                        "max_sets": max_sets_conv,
+                        "legs": [
+                            f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Depth: {c_bvol:,.0f})",
+                            f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Depth: {p_avol:,.0f})",
+                            f"Buy Futures {fut_sym} @ Ask <code>{f_ask:.2f}</code> (Depth: {f_avol:,.0f})"
+                        ]
+                    }
+                    if ts not in minute_bests or net_conv > minute_bests[ts]:
+                        minute_bests[ts] = net_conv
 
-                if net_conv > 0:
-                    opportunities.append(item_conv)
-                if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
-                    best_near_miss = item_conv
+                    if net_conv > 0:
+                        opportunities.append(item_conv)
+                    if best_near_miss is None or net_conv > best_near_miss["net_pts"]:
+                        best_near_miss = item_conv
 
             # 2. Reversal: (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
-            try:
-                disc_diff_mid = (f_mid - k) * disc_factor
-                mid_edge_rev = disc_diff_mid - (c_mid - p_mid)
+            # Requires strict depth: Buy Call @ Ask, Sell Put @ Bid, Sell Fut @ Bid
+            if c_avol > 0 and p_bvol > 0 and f_bvol > 0:
+                max_sets_rev = int(min(c_avol, p_bvol, f_bvol))
+                try:
+                    disc_diff_mid = (f_mid - k) * disc_factor
+                    mid_edge_rev = disc_diff_mid - (c_mid - p_mid)
 
-                disc_diff_rev = (f_bid - k) * disc_factor
-                gross_rev = disc_diff_rev - (c_ask - p_bid)
-                if math.isnan(gross_rev) or math.isinf(gross_rev):
+                    disc_diff_rev = (f_bid - k) * disc_factor
+                    gross_rev = disc_diff_rev - (c_ask - p_bid)
+                    if math.isnan(gross_rev) or math.isinf(gross_rev):
+                        calc_error_count += 1
+                        gross_rev = None
+                except Exception:
                     calc_error_count += 1
                     gross_rev = None
-            except Exception:
-                calc_error_count += 1
-                gross_rev = None
 
-            if gross_rev is not None:
-                net_rev = gross_rev - COMMISSION
-                spread_cost_rev = mid_edge_rev - gross_rev
-                item_rev = {
-                    "strategy": "Reversal (Buy C, Sell P, Sell Fut)",
-                    "target": f"Strike {k:.0f} & {fut_sym}",
-                    "tag": liq_tag,
-                    "time": ts,
-                    "series": front_series,
-                    "strike": k,
-                    "gross_pts": gross_rev,
-                    "net_pts": net_rev,
-                    "mid_edge": mid_edge_rev,
-                    "spread_cost": spread_cost_rev,
-                    "commission_pts": COMMISSION,
-                    "max_sets": max_sets_rev,
-                    "legs": [
-                        f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Vol: {c_vol:,.0f})",
-                        f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Vol: {p_vol:,.0f})",
-                        f"Sell Futures {fut_sym} @ Bid <code>{f_bid:.2f}</code> (Vol: {f_vol:,.0f})"
-                    ]
-                }
-                if ts not in minute_bests or net_rev > minute_bests[ts]:
-                    minute_bests[ts] = net_rev
+                if gross_rev is not None:
+                    net_rev = gross_rev - COMMISSION
+                    spread_cost_rev = mid_edge_rev - gross_rev
+                    item_rev = {
+                        "strategy": "Reversal (Buy C, Sell P, Sell Fut)",
+                        "target": f"Strike {k:.0f} & {fut_sym}",
+                        "tag": liq_tag,
+                        "time": ts,
+                        "series": front_series,
+                        "strike": k,
+                        "gross_pts": gross_rev,
+                        "net_pts": net_rev,
+                        "mid_edge": mid_edge_rev,
+                        "spread_cost": spread_cost_rev,
+                        "commission_pts": COMMISSION,
+                        "max_sets": max_sets_rev,
+                        "legs": [
+                            f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Depth: {c_avol:,.0f})",
+                            f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Depth: {p_bvol:,.0f})",
+                            f"Sell Futures {fut_sym} @ Bid <code>{f_bid:.2f}</code> (Depth: {f_bvol:,.0f})"
+                        ]
+                    }
+                    if ts not in minute_bests or net_rev > minute_bests[ts]:
+                        minute_bests[ts] = net_rev
 
-                if net_rev > 0:
-                    opportunities.append(item_rev)
-                if best_near_miss is None or net_rev > best_near_miss["net_pts"]:
-                    best_near_miss = item_rev
+                    if net_rev > 0:
+                        opportunities.append(item_rev)
+                    if best_near_miss is None or net_rev > best_near_miss["net_pts"]:
+                        best_near_miss = item_rev
 
     return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count, minute_bests
 
@@ -668,13 +691,11 @@ def scan_vertical_spreads(
                     continue
                 net = gross - COMMISSION
                 spread_cost = mid_edge - gross
-                v_c1, v_c2 = c1.get("volume", 0.0), c2.get("volume", 0.0)
                 v_c1_ask = c1.get("ask_vol", 0.0) or 0.0
                 v_c2_bid = c2.get("bid_vol", 0.0) or 0.0
-                if v_c1_ask > 0 and v_c2_bid > 0:
-                    max_sets = int(min(v_c1_ask, v_c2_bid))
-                else:
-                    max_sets = int(min(v_c1, v_c2)) if (v_c1 > 0 and v_c2 > 0) else 1
+                if v_c1_ask <= 0 or v_c2_bid <= 0:
+                    continue
+                max_sets = int(min(v_c1_ask, v_c2_bid))
 
                 item = {
                     "strategy": "Call Monotonicity Violation",
@@ -690,8 +711,8 @@ def scan_vertical_spreads(
                     "commission_pts": COMMISSION,
                     "max_sets": max_sets,
                     "legs": [
-                        f"Buy Call {k1:.0f} @ Ask <code>{c1['ask']:.2f}</code> (Vol: {c1.get('volume', 0):,.0f})",
-                        f"Sell Call {k2:.0f} @ Bid <code>{c2['bid']:.2f}</code> (Vol: {c2.get('volume', 0):,.0f})"
+                        f"Buy Call {k1:.0f} @ Ask <code>{c1['ask']:.2f}</code> (Depth: {v_c1_ask:,.0f})",
+                        f"Sell Call {k2:.0f} @ Bid <code>{c2['bid']:.2f}</code> (Depth: {v_c2_bid:,.0f})"
                     ]
                 }
                 if ts not in minute_bests or net > minute_bests[ts]:
@@ -729,13 +750,11 @@ def scan_vertical_spreads(
                     continue
                 net = gross - COMMISSION
                 spread_cost = mid_edge - gross
-                v_p1, v_p2 = p1.get("volume", 0.0), p2.get("volume", 0.0)
                 v_p2_ask = p2.get("ask_vol", 0.0) or 0.0
                 v_p1_bid = p1.get("bid_vol", 0.0) or 0.0
-                if v_p2_ask > 0 and v_p1_bid > 0:
-                    max_sets = int(min(v_p2_ask, v_p1_bid))
-                else:
-                    max_sets = int(min(v_p1, v_p2)) if (v_p1 > 0 and v_p2 > 0) else 1
+                if v_p2_ask <= 0 or v_p1_bid <= 0:
+                    continue
+                max_sets = int(min(v_p2_ask, v_p1_bid))
 
                 item = {
                     "strategy": "Put Monotonicity Violation",
@@ -751,8 +770,8 @@ def scan_vertical_spreads(
                     "commission_pts": COMMISSION,
                     "max_sets": max_sets,
                     "legs": [
-                        f"Buy Put {k2:.0f} @ Ask <code>{p2['ask']:.2f}</code> (Vol: {p2.get('volume', 0):,.0f})",
-                        f"Sell Put {k1:.0f} @ Bid <code>{p1['bid']:.2f}</code> (Vol: {p1.get('volume', 0):,.0f})"
+                        f"Buy Put {k2:.0f} @ Ask <code>{p2['ask']:.2f}</code> (Depth: {v_p2_ask:,.0f})",
+                        f"Sell Put {k1:.0f} @ Bid <code>{p1['bid']:.2f}</code> (Depth: {v_p1_bid:,.0f})"
                     ]
                 }
                 if ts not in minute_bests or net > minute_bests[ts]:
@@ -786,8 +805,12 @@ def scan_calendar_spreads(
         if not f1 or not f2:
             continue
 
-        b1, a1, v1 = f1.get("bid"), f1.get("ask"), f1.get("volume", 0.0)
-        b2, a2, v2 = f2.get("bid"), f2.get("ask"), f2.get("volume", 0.0)
+        b1, a1 = f1.get("bid"), f1.get("ask")
+        b2, a2 = f2.get("bid"), f2.get("ask")
+        b1_vol = f1.get("bid_vol", 0.0) or 0.0
+        a1_vol = f1.get("ask_vol", 0.0) or 0.0
+        b2_vol = f2.get("bid_vol", 0.0) or 0.0
+        a2_vol = f2.get("ask_vol", 0.0) or 0.0
 
         if (b1 is None or a1 is None or b1 <= 0 or a1 <= 0 or a1 < b1 or
             b2 is None or a2 is None or b2 <= 0 or a2 <= 0 or a2 < b2):
@@ -800,8 +823,8 @@ def scan_calendar_spreads(
 
         spread_records.append({
             "ts": ts,
-            "b1": b1, "a1": a1, "v1": v1,
-            "b2": b2, "a2": a2, "v2": v2,
+            "b1": b1, "a1": a1, "b1_vol": b1_vol, "a1_vol": a1_vol,
+            "b2": b2, "a2": a2, "b2_vol": b2_vol, "a2_vol": a2_vol,
             "mid_spread": mid_spread
         })
 
@@ -810,21 +833,27 @@ def scan_calendar_spreads(
 
     df_sp = pd.DataFrame(spread_records)
     df_sp["rolling_mean"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).mean()
-    df_sp["rolling_std"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).std().fillna(0.15)
-    df_sp["rolling_std"] = df_sp["rolling_std"].clip(lower=0.10)
+    df_sp["rolling_std"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).std()
 
     opportunities: List[Dict[str, Any]] = []
     best_near_miss: Optional[Dict[str, Any]] = None
 
     for _, row in df_sp.iterrows():
         ts = row["ts"]
-        b1, a1, v1 = row["b1"], row["a1"], row["v1"]
-        b2, a2, v2 = row["b2"], row["a2"], row["v2"]
+        b1, a1 = row["b1"], row["a1"]
+        b2, a2 = row["b2"], row["a2"]
+        b1_vol, a1_vol = row["b1_vol"], row["a1_vol"]
+        b2_vol, a2_vol = row["b2_vol"], row["a2_vol"]
         mu = row["rolling_mean"]
         std = row["rolling_std"]
-        max_sets = int(min(v1, v2)) if (v1 > 0 and v2 > 0) else 1
+        if pd.isna(mu) or pd.isna(std) or std <= 0.0001:
+            continue
 
         # Case 1: Spread Spikes UP -> Sell Front @ b1, Buy Next @ a2
+        if b1_vol <= 0 or a2_vol <= 0:
+            continue
+        max_sets_up = int(min(b1_vol, a2_vol))
+
         mid1 = (b1 + a1) / 2.0
         mid2 = (b2 + a2) / 2.0
         mid_spread = mid1 - mid2
@@ -849,10 +878,10 @@ def scan_calendar_spreads(
             "mid_edge": mid_edge_up,
             "spread_cost": spread_cost_up,
             "commission_pts": COMMISSION,
-            "max_sets": max_sets,
+            "max_sets": max_sets_up,
             "legs": [
-                f"Sell Front {f1_sym} @ Bid <code>{b1:.2f}</code> (Vol: {v1:,.0f})",
-                f"Buy Next {f2_sym} @ Ask <code>{a2:.2f}</code> (Vol: {v2:,.0f})"
+                f"Sell Front {f1_sym} @ Bid <code>{b1:.2f}</code> (Depth: {b1_vol:,.0f})",
+                f"Buy Next {f2_sym} @ Ask <code>{a2:.2f}</code> (Depth: {a2_vol:,.0f})"
             ],
             "stats": f"Spread: {exec_sell_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_up:.2f} pts / +{(dev_up/std):.1f}σ)"
         }
@@ -865,6 +894,10 @@ def scan_calendar_spreads(
             best_near_miss = item_up
 
         # Case 2: Spread Spikes DOWN -> Buy Front @ a1, Sell Next @ b2
+        if a1_vol <= 0 or b2_vol <= 0:
+            continue
+        max_sets_down = int(min(a1_vol, b2_vol))
+
         exec_buy_spread = a1 - b2
         dev_down = mu - exec_buy_spread
         mid_edge_down = mu - mid_spread
@@ -885,10 +918,10 @@ def scan_calendar_spreads(
             "mid_edge": mid_edge_down,
             "spread_cost": spread_cost_down,
             "commission_pts": COMMISSION,
-            "max_sets": max_sets,
+            "max_sets": max_sets_down,
             "legs": [
-                f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Vol: {v1:,.0f})",
-                f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Vol: {v2:,.0f})"
+                f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Depth: {a1_vol:,.0f})",
+                f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Depth: {b2_vol:,.0f})"
             ],
             "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_down:.2f} pts / +{(dev_down/std):.1f}σ)"
         }

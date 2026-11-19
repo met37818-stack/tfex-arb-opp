@@ -43,8 +43,8 @@ def build_mock_intraday_data(num_bars: int = 60, front_series: str = "Z26", next
         f2_vol = 30.0
 
         futures = {
-            f"S50{front_series}": {"bid": f1_bid, "ask": f1_ask, "volume": f1_vol},
-            f"S50{next_series}": {"bid": f2_bid, "ask": f2_ask, "volume": f2_vol}
+            f"S50{front_series}": {"bid": f1_bid, "ask": f1_ask, "volume": f1_vol, "bid_vol": 10.0, "ask_vol": 10.0},
+            f"S50{next_series}": {"bid": f2_bid, "ask": f2_ask, "volume": f2_vol, "bid_vol": 10.0, "ask_vol": 10.0}
         }
 
         # Options chain: Strikes 900, 910, 920, 930, 940
@@ -59,8 +59,8 @@ def build_mock_intraday_data(num_bars: int = 60, front_series: str = "Z26", next
             p_bid = p_mid - 0.3
             p_ask = p_mid + 0.3
 
-            options[(front_series, k, "C")] = {"bid": c_bid, "ask": c_ask, "volume": 20.0, "strike": k, "series": front_series, "option_type": "C"}
-            options[(front_series, k, "P")] = {"bid": p_bid, "ask": p_ask, "volume": 20.0, "strike": k, "series": front_series, "option_type": "P"}
+            options[(front_series, k, "C")] = {"bid": c_bid, "ask": c_ask, "volume": 20.0, "bid_vol": 10.0, "ask_vol": 10.0, "strike": k, "series": front_series, "option_type": "C"}
+            options[(front_series, k, "P")] = {"bid": p_bid, "ask": p_ask, "volume": 20.0, "bid_vol": 10.0, "ask_vol": 10.0, "strike": k, "series": front_series, "option_type": "P"}
 
         grouped[ts] = {
             "futures": futures,
@@ -303,17 +303,18 @@ def test_zero_traded_volume_with_valid_quotes():
     grouped = {}
     for i in range(15):
         ts = f"10:{i:02d}:00"
+        f2_shift = (i % 3) * 0.2
         grouped[ts] = {
             "spot": 920.0,
             "futures": {
-                f"S50{front_series}": {"bid": 920.0, "ask": 920.4, "volume": 0.0},
-                f"S50{next_series}": {"bid": 922.0, "ask": 922.5, "volume": 0.0}
+                f"S50{front_series}": {"bid": 920.0, "ask": 920.4, "volume": 0.0, "bid_vol": 10.0, "ask_vol": 10.0},
+                f"S50{next_series}": {"bid": 922.0 + f2_shift, "ask": 922.5 + f2_shift, "volume": 0.0, "bid_vol": 10.0, "ask_vol": 10.0}
             },
             "options": {
-                (front_series, 920.0, "C"): {"bid": 10.0, "ask": 10.5, "volume": 0.0, "strike": 920.0, "series": front_series, "option_type": "C"},
-                (front_series, 920.0, "P"): {"bid": 9.0, "ask": 9.5, "volume": 0.0, "strike": 920.0, "series": front_series, "option_type": "P"},
-                (front_series, 930.0, "C"): {"bid": 5.0, "ask": 5.5, "volume": 0.0, "strike": 930.0, "series": front_series, "option_type": "C"},
-                (front_series, 930.0, "P"): {"bid": 14.0, "ask": 14.5, "volume": 0.0, "strike": 930.0, "series": front_series, "option_type": "P"},
+                (front_series, 920.0, "C"): {"bid": 10.0, "ask": 10.5, "volume": 0.0, "bid_vol": 10.0, "ask_vol": 10.0, "strike": 920.0, "series": front_series, "option_type": "C"},
+                (front_series, 920.0, "P"): {"bid": 9.0, "ask": 9.5, "volume": 0.0, "bid_vol": 10.0, "ask_vol": 10.0, "strike": 920.0, "series": front_series, "option_type": "P"},
+                (front_series, 930.0, "C"): {"bid": 5.0, "ask": 5.5, "volume": 0.0, "bid_vol": 10.0, "ask_vol": 10.0, "strike": 930.0, "series": front_series, "option_type": "C"},
+                (front_series, 930.0, "P"): {"bid": 14.0, "ask": 14.5, "volume": 0.0, "bid_vol": 10.0, "ask_vol": 10.0, "strike": 930.0, "series": front_series, "option_type": "P"},
             }
         }
 

@@ -120,6 +120,52 @@ class TestASOFForwardFill(unittest.TestCase):
             if "Conversion" in near_miss["strategy"]:
                 self.assertEqual(near_miss["max_sets"], 10)
 
+    @patch("arb_scanner.execute_turso_sql")
+    def test_asof_forward_fill_prunes_older_than_15_minutes(self, mock_sql):
+        # Minute 1: 10:00:00 (C900)
+        # Minute 2: 10:14:00 (14 min later: C900 should still be preserved)
+        # Minute 3: 10:16:00 (16 min later: C900 should be pruned because > 900 seconds)
+        mock_rows_spot = [
+            ("2026-11-19 10:00:00", 920.0, 1000, 100000),
+            ("2026-11-19 10:14:00", 920.5, 2000, 200000),
+            ("2026-11-19 10:16:00", 921.0, 3000, 300000),
+        ]
+        mock_rows_fut = [
+            ("2026-11-19 10:00:00", "S50Z26", 920.0, 920.4, 920.2, 500.0, 10000.0, 50.0, 60.0),
+            ("2026-11-19 10:14:00", "S50Z26", 920.5, 920.9, 920.7, 600.0, 10000.0, 55.0, 65.0),
+            ("2026-11-19 10:16:00", "S50Z26", 921.0, 921.4, 921.2, 700.0, 10000.0, 70.0, 80.0),
+        ]
+        # Option C900 only updated at 10:00:00, P900 updated at 10:16:00
+        mock_rows_opt = [
+            ("2026-11-19 10:00:00", "S50Z26C900", "Z26", 900.0, "C", 22.0, 22.5, 22.2, 50.0, 100.0, 10.0, 15.0),
+            ("2026-11-19 10:16:00", "S50Z26P900", "Z26", 900.0, "P", 2.0, 2.4, 2.2, 30.0, 80.0, 12.0, 18.0),
+        ]
+
+        def side_effect(url, token, sql, args):
+            if "spot_snapshots" in sql:
+                return None, mock_rows_spot
+            elif "futures_snapshots" in sql:
+                return None, mock_rows_fut
+            elif "options_snapshots" in sql:
+                return None, mock_rows_opt
+            return None, []
+
+        mock_sql.side_effect = side_effect
+
+        grouped, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
+            "https://test", "token", "2026-11-19", "10:00:00", "10:16:00"
+        )
+
+        # At 10:14:00 (14 min since 10:00:00), C900 must still exist (<= 15 min)
+        m_14 = grouped["2026-11-19 10:14:00"]
+        self.assertIn(("Z26", 900.0, "C"), m_14["options"])
+
+        # At 10:16:00 (16 min since 10:00:00), C900 must be pruned (> 15 min)
+        m_16 = grouped["2026-11-19 10:16:00"]
+        self.assertNotIn(("Z26", 900.0, "C"), m_16["options"])
+        # But P900 updated at 10:16:00 must be present
+        self.assertIn(("Z26", 900.0, "P"), m_16["options"])
+
 
 if __name__ == "__main__":
     unittest.main()
