@@ -18,7 +18,8 @@ from arb_scanner import (
     format_telegram_report,
     COMMISSION_3LEG_PTS,
     COMMISSION_2LEG_PTS,
-    select_dynamic_thor_rate
+    select_dynamic_thor_rate,
+    is_executable_market_hours
 )
 
 
@@ -381,6 +382,79 @@ def test_dynamic_thor_rate_selection():
     assert math.isclose(r_on, 0.0099479, abs_tol=1e-7)
 
     print("✅ Dynamic THOR Rate Tenor Matching & Fallbacks Verified!")
+
+
+def test_is_executable_market_hours():
+    """Verifies Market Hours Guard for executable trading windows vs post-market/lunch suppression."""
+    from datetime import time as dt_time, datetime as dt_datetime
+
+    # Morning session: 09:45:00 - 12:30:00
+    assert is_executable_market_hours(dt_time(9, 44, 59)) is False
+    assert is_executable_market_hours(dt_time(9, 45, 0)) is True
+    assert is_executable_market_hours(dt_time(10, 30, 15)) is True
+    assert is_executable_market_hours(dt_time(12, 30, 0)) is True
+    assert is_executable_market_hours(dt_time(12, 30, 1)) is False
+
+    # Lunch break
+    assert is_executable_market_hours(dt_time(13, 0, 0)) is False
+    assert is_executable_market_hours(dt_time(14, 14, 59)) is False
+
+    # Afternoon session: 14:15:00 - 16:55:00
+    assert is_executable_market_hours(dt_time(14, 15, 0)) is True
+    assert is_executable_market_hours(dt_time(15, 45, 30)) is True
+    assert is_executable_market_hours(dt_time(16, 55, 0)) is True
+
+    # Post-market: 16:55:01 onwards (MMs withdraw quotes -> MUST suppress live alerts)
+    assert is_executable_market_hours(dt_time(16, 55, 1)) is False
+    assert is_executable_market_hours(dt_time(17, 0, 0)) is False
+    assert is_executable_market_hours(dt_time(17, 5, 0)) is False
+    assert is_executable_market_hours(dt_time(18, 0, 0)) is False
+
+    # Datetime inputs
+    dt_active = dt_datetime(2026, 11, 19, 10, 15, 0)
+    dt_post = dt_datetime(2026, 11, 19, 16, 56, 0)
+    assert is_executable_market_hours(dt_active) is True
+    assert is_executable_market_hours(dt_post) is False
+
+    print("✅ Market Hours Guard Verified (Active 09:45-12:30 & 14:15-16:55, Suppressed 16:55-17:05)")
+
+
+def test_sub_minute_coalescing_in_best_of_minute_stats():
+    """Verifies that multiple sub-minute ticks within the same minute are coalesced into 1-minute buckets."""
+    # 3 sub-minute events in minute 10:05, 2 in 10:06
+    p_mins = {
+        "2026-11-19 10:05:05": 1.10,
+        "2026-11-19 10:05:25": 1.50,
+        "2026-11-19 10:05:45": 0.90,
+        "2026-11-19 10:06:10": 2.00,
+        "2026-11-19 10:06:40": 2.40,
+    }
+    v_mins = {
+        "2026-11-19 10:05:15": 1.30,
+        "2026-11-19 10:06:20": 2.20,
+    }
+    c_mins = {}
+
+    keys = list(p_mins.keys()) + list(v_mins.keys())
+
+    stats = compute_best_of_minute_stats(
+        grouped_data_keys=keys,
+        p_mins=p_mins,
+        v_mins=v_mins,
+        c_mins=c_mins
+    )
+
+    # Should coalesce to exactly 2 distinct minute buckets: 10:05 and 10:06
+    assert stats["has_data"] is True
+    assert stats["bar_count"] == 2
+    # Minute 10:05 best = max(1.10, 1.50, 0.90, 1.30) = 1.50
+    # Minute 10:06 best = max(2.00, 2.40, 2.20) = 2.40
+    # Overall max = 2.40
+    assert math.isclose(stats["max"], 2.40, abs_tol=1e-7)
+    # Average = (1.50 + 2.40) / 2 = 1.95
+    assert math.isclose(stats["avg"], 1.95, abs_tol=1e-7)
+
+    print("✅ Sub-Minute Timestamp Coalescing to 1-Minute Buckets Verified!")
 
 
 if __name__ == "__main__":

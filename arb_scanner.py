@@ -982,6 +982,26 @@ def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool
         return False
 
 
+def is_executable_market_hours(dt_or_time: Any) -> bool:
+    """
+    Market Hours Guard:
+    Checks if given datetime or time is within actual executable trading hours:
+    - Morning: 09:45:00 - 12:30:00
+    - Afternoon: 14:15:00 - 16:55:00
+    Returns False outside these windows (e.g. 16:55:01 - 17:05:00 is post-market when MMs withdraw quotes).
+    """
+    if isinstance(dt_or_time, datetime.datetime):
+        t = dt_or_time.time()
+    elif isinstance(dt_or_time, time):
+        t = dt_or_time
+    else:
+        return False
+
+    is_morning = (time(9, 45, 0) <= t <= time(12, 30, 0))
+    is_afternoon = (time(14, 15, 0) <= t <= time(16, 55, 0))
+    return is_morning or is_afternoon
+
+
 class ArbSmartCooldown:
     """
     In-memory smart cooldown cache for real-time 1-minute arbitrage alerts.
@@ -1130,17 +1150,45 @@ def compute_best_of_minute_stats(
     v_mins: Dict[str, float],
     c_mins: Dict[str, float]
 ) -> Dict[str, Any]:
+    """
+    Coalesces sub-minute timestamps into 1-minute buckets (YYYY-MM-DD HH:MM or HH:MM)
+    and extracts the best (maximum) net profit across parity, vertical, and calendar spreads
+    for each distinct minute.
+    Calculates summary metrics: Max, P90, Mean, SD, and near-breakeven percentage.
+    """
+    def to_minute_bucket(ts_str: str) -> str:
+        # e.g. "2026-11-19 10:05:23" -> "2026-11-19 10:05"
+        # e.g. "10:05:23" -> "10:05"
+        if len(ts_str) >= 16 and (ts_str[10] == " " or ts_str[10] == "T"):
+            return ts_str[:16]
+        elif len(ts_str) >= 5 and ":" in ts_str:
+            return ts_str[:5]
+        return ts_str
+
+    # Gather best per minute bucket
+    bests_by_minute: Dict[str, float] = {}
+    for source_dict in (p_mins, v_mins, c_mins):
+        for ts, val in source_dict.items():
+            m_bkt = to_minute_bucket(ts)
+            if m_bkt not in bests_by_minute or val > bests_by_minute[m_bkt]:
+                bests_by_minute[m_bkt] = val
+
     minute_bests = []
-    for ts in sorted(grouped_data_keys):
-        candidates = []
-        if ts in p_mins:
-            candidates.append(p_mins[ts])
-        if ts in v_mins:
-            candidates.append(v_mins[ts])
-        if ts in c_mins:
-            candidates.append(c_mins[ts])
-        if candidates:
-            minute_bests.append(max(candidates))
+    if grouped_data_keys:
+        # Preserve chronological order of distinct minute buckets
+        distinct_minutes = []
+        seen = set()
+        for k in sorted(grouped_data_keys):
+            m_bkt = to_minute_bucket(k)
+            if m_bkt not in seen:
+                seen.add(m_bkt)
+                distinct_minutes.append(m_bkt)
+        for m_bkt in distinct_minutes:
+            if m_bkt in bests_by_minute:
+                minute_bests.append(bests_by_minute[m_bkt])
+    else:
+        for m_bkt in sorted(bests_by_minute.keys()):
+            minute_bests.append(bests_by_minute[m_bkt])
 
     if not minute_bests:
         return {
@@ -1416,7 +1464,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
     print("=" * 75)
-    print(f"TFEX REAL-TIME 1-MIN ARBITRAGE WORKER STARTED: {session_mode}")
+    print(f"TFEX REAL-TIME SUB-MINUTE ARBITRAGE WORKER STARTED: {session_mode}")
     print(f"Date: {trade_date} | Front: {front_series} (DTE: {dte}d) | THOR ({thor_tenor}): {thor_rate*100.0:.2f}%")
     print(f"Trading Hours: {session_start_time.strftime('%H:%M:%S')} – {session_end_time.strftime('%H:%M:%S')}")
     print("=" * 75)
@@ -1450,12 +1498,23 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     last_scanned_ts = max(session_dataset.keys()) if session_dataset else None
     print(f"[WORKER] Initial dataset ready: {len(session_dataset)} bars loaded. Last bar: {last_scanned_ts}")
 
+    # Seed running AS-OF continuous state
+    if last_scanned_ts and last_scanned_ts in session_dataset:
+        latest_seed = session_dataset[last_scanned_ts]
+        running_spot: Optional[float] = latest_seed.get("spot")
+        running_futures: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in latest_seed.get("futures", {}).items()}
+        running_options: Dict[Tuple[str, float, str], Dict[str, Any]] = {k: dict(v) for k, v in latest_seed.get("options", {}).items()}
+    else:
+        running_spot = None
+        running_futures = {}
+        running_options = {}
+
     # Initialize Smart Anti-Spam Cooldown
     cooldown = ArbSmartCooldown(cooldown_seconds=900, profit_hurdle_pts=0.20)
     last_heartbeat_time = pytime.time()
 
     # --------------------------------------------------------------------------
-    # Real-time 1-Minute Live Loop
+    # Real-time Sub-Minute Live Loop (Polls Turso every 5 seconds)
     # --------------------------------------------------------------------------
     bound_start = f"{trade_date} {summary_start_str}"
     bound_end = f"{trade_date} {summary_end_str}"
@@ -1473,68 +1532,158 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
             record_arb_heartbeat(pipeline_url, turso_token, session_mode, curr_bkk)
             last_heartbeat_time = pytime.time()
 
-        # In each minute, wait until second :06
-        curr_sec = curr_bkk.second
-        if curr_sec < 6:
-            sleep_sec = 6 - curr_sec
-            pytime.sleep(sleep_sec)
-            curr_bkk = datetime.datetime.now(BANGKOK_TZ)
-
-        # Polling for newly written 1-minute bar in Turso (check MAX captured_at_bkk every 3s up to second :52)
+        # Check for newly written event in Turso
         new_ts_found = None
-        while curr_bkk.time() < session_end_time and curr_bkk.second <= 52:
+        try:
+            _, check_rows = execute_turso_sql(pipeline_url, turso_token, sql_check, [bound_start, bound_end])
+            turso_max_ts = str(check_rows[0][0]) if check_rows and check_rows[0][0] else None
+        except Exception as e:
+            print(f"[POLL] Error checking Turso max timestamp: {e}")
+            turso_max_ts = None
+
+        if turso_max_ts and (last_scanned_ts is None or turso_max_ts > last_scanned_ts):
+            # Verify options_snapshots also has data for turso_max_ts
             try:
-                _, check_rows = execute_turso_sql(pipeline_url, turso_token, sql_check, [bound_start, bound_end])
-                turso_max_ts = str(check_rows[0][0]) if check_rows and check_rows[0][0] else None
+                _, opt_check_rows = execute_turso_sql(pipeline_url, turso_token, sql_opt_check, [turso_max_ts])
+                opt_bar_cnt = int(opt_check_rows[0][0]) if opt_check_rows and opt_check_rows[0][0] else 0
             except Exception as e:
-                print(f"[POLL] Error checking Turso max timestamp: {e}")
-                turso_max_ts = None
+                print(f"[POLL] Error checking options count for {turso_max_ts}: {e}")
+                opt_bar_cnt = 0
 
-            if turso_max_ts and (last_scanned_ts is None or turso_max_ts > last_scanned_ts):
-                # Verify options_snapshots also has data for turso_max_ts
-                try:
-                    _, opt_check_rows = execute_turso_sql(pipeline_url, turso_token, sql_opt_check, [turso_max_ts])
-                    opt_bar_cnt = int(opt_check_rows[0][0]) if opt_check_rows and opt_check_rows[0][0] else 0
-                except Exception as e:
-                    print(f"[POLL] Error checking options count for {turso_max_ts}: {e}")
-                    opt_bar_cnt = 0
-
-                if opt_bar_cnt > 0:
-                    new_ts_found = turso_max_ts
-                    break
-
-            # If not yet written to Turso, wait 3 seconds and retry
-            pytime.sleep(3)
-            curr_bkk = datetime.datetime.now(BANGKOK_TZ)
+            if opt_bar_cnt > 0:
+                new_ts_found = turso_max_ts
 
         if new_ts_found:
-            bar_time_str = new_ts_found[11:19]
-            # Fetch newly arrived bar
-            new_data, _, _ = fetch_intraday_arb_dataset(
-                pipeline_url=pipeline_url,
-                auth_token=turso_token,
-                trade_date=trade_date,
-                start_time_bkk=bar_time_str,
-                end_time_bkk=bar_time_str
-            )
-            session_dataset.update(new_data)
+            delta_start = last_scanned_ts if last_scanned_ts else bound_start
+
+            # Fetch delta spot
+            sql_delta_spot = "SELECT captured_at_bkk, last FROM spot_snapshots WHERE captured_at_bkk > ? AND captured_at_bkk <= ? ORDER BY captured_at_bkk ASC;"
+            try:
+                _, rows_spot = execute_turso_sql(pipeline_url, turso_token, sql_delta_spot, [delta_start, new_ts_found])
+                for r in rows_spot:
+                    if r[1] is not None:
+                        running_spot = float(r[1])
+            except Exception as e:
+                print(f"[DELTA] Error fetching spot delta: {e}")
+
+            # Fetch delta futures
+            sql_delta_fut_depth = "SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest, bid_vol, ask_vol FROM futures_snapshots WHERE captured_at_bkk > ? AND captured_at_bkk <= ? ORDER BY captured_at_bkk ASC;"
+            try:
+                _, rows_fut = execute_turso_sql(pipeline_url, turso_token, sql_delta_fut_depth, [delta_start, new_ts_found])
+                has_fut_depth = True
+            except Exception:
+                sql_delta_fut_fb = "SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest FROM futures_snapshots WHERE captured_at_bkk > ? AND captured_at_bkk <= ? ORDER BY captured_at_bkk ASC;"
+                try:
+                    _, rows_fut = execute_turso_sql(pipeline_url, turso_token, sql_delta_fut_fb, [delta_start, new_ts_found])
+                except Exception as e:
+                    print(f"[DELTA] Error fetching futures delta: {e}")
+                    rows_fut = []
+                has_fut_depth = False
+
+            for r in rows_fut:
+                sym = str(r[1])
+                bid, ask, last, vol, oi = r[2], r[3], r[4], r[5], r[6]
+                bid_vol = float(r[7]) if (has_fut_depth and len(r) > 7 and r[7] is not None) else 0.0
+                ask_vol = float(r[8]) if (has_fut_depth and len(r) > 8 and r[8] is not None) else 0.0
+                running_futures[sym] = {
+                    "symbol": sym,
+                    "bid": float(bid) if bid is not None else None,
+                    "ask": float(ask) if ask is not None else None,
+                    "bid_vol": bid_vol,
+                    "ask_vol": ask_vol,
+                    "last": float(last) if last is not None else None,
+                    "volume": float(vol) if vol is not None else 0.0,
+                    "oi": float(oi) if oi is not None else 0.0,
+                    "last_update_ts": str(r[0])
+                }
+
+            # Fetch delta options
+            sql_delta_opt_depth = "SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest, bid_vol, ask_vol FROM options_snapshots WHERE captured_at_bkk > ? AND captured_at_bkk <= ? ORDER BY captured_at_bkk ASC;"
+            try:
+                _, rows_opt = execute_turso_sql(pipeline_url, turso_token, sql_delta_opt_depth, [delta_start, new_ts_found])
+                has_opt_depth = True
+            except Exception:
+                sql_delta_opt_fb = "SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest FROM options_snapshots WHERE captured_at_bkk > ? AND captured_at_bkk <= ? ORDER BY captured_at_bkk ASC;"
+                try:
+                    _, rows_opt = execute_turso_sql(pipeline_url, turso_token, sql_delta_opt_fb, [delta_start, new_ts_found])
+                except Exception as e:
+                    print(f"[DELTA] Error fetching options delta: {e}")
+                    rows_opt = []
+                has_opt_depth = False
+
+            for r in rows_opt:
+                sym, series, strike, otype = r[1], r[2], r[3], r[4]
+                bid, ask, last, vol, oi = r[5], r[6], r[7], r[8], r[9]
+                bid_vol = float(r[10]) if (has_opt_depth and len(r) > 10 and r[10] is not None) else 0.0
+                ask_vol = float(r[11]) if (has_opt_depth and len(r) > 11 and r[11] is not None) else 0.0
+                key = (str(series), float(strike), str(otype).upper())
+                running_options[key] = {
+                    "symbol": str(sym),
+                    "series": str(series),
+                    "strike": float(strike),
+                    "option_type": str(otype).upper(),
+                    "bid": float(bid) if bid is not None else None,
+                    "ask": float(ask) if ask is not None else None,
+                    "bid_vol": bid_vol,
+                    "ask_vol": ask_vol,
+                    "last": float(last) if last is not None else None,
+                    "volume": float(vol) if vol is not None else 0.0,
+                    "oi": float(oi) if oi is not None else 0.0,
+                    "last_update_ts": str(r[0])
+                }
+
+            # Strict Staleness Guard: Prune quotes older than 15 minutes (900 seconds)
+            try:
+                curr_dt = datetime.datetime.strptime(new_ts_found[:19], "%Y-%m-%d %H:%M:%S")
+                for sym in list(running_futures.keys()):
+                    u_ts = running_futures[sym].get("last_update_ts")
+                    if u_ts:
+                        try:
+                            u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
+                            if (curr_dt - u_dt).total_seconds() > 900:
+                                del running_futures[sym]
+                        except Exception:
+                            pass
+
+                for key in list(running_options.keys()):
+                    u_ts = running_options[key].get("last_update_ts")
+                    if u_ts:
+                        try:
+                            u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
+                            if (curr_dt - u_dt).total_seconds() > 900:
+                                del running_options[key]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Snapshot AS-OF state
+            current_snapshot = {
+                "spot": running_spot,
+                "futures": {k: dict(v) for k, v in running_futures.items()},
+                "options": {k: dict(v) for k, v in running_options.items()}
+            }
+            session_dataset[new_ts_found] = current_snapshot
             last_scanned_ts = new_ts_found
 
-            if new_ts_found in session_dataset:
-                single_bar = {new_ts_found: session_dataset[new_ts_found]}
-                p_opps, _, d1, e1, _ = scan_put_call_parity(single_bar, front_series, thor_rate, T_years)
-                v_opps, _, d2, e2, _ = scan_vertical_spreads(single_bar, front_series)
-                # Calendar spreads use rolling session_dataset, filtered by current bar timestamp
-                c_opps, _, d3, e3, _ = scan_calendar_spreads(session_dataset, front_series, next_series)
-                c_curr = [c for c in c_opps if c.get("time") == new_ts_found]
+            # Scan opportunities
+            single_bar = {new_ts_found: current_snapshot}
+            p_opps, _, d1, e1, _ = scan_put_call_parity(single_bar, front_series, thor_rate, T_years)
+            v_opps, _, d2, e2, _ = scan_vertical_spreads(single_bar, front_series)
+            c_opps, _, d3, e3, _ = scan_calendar_spreads(session_dataset, front_series, next_series)
+            c_curr = [c for c in c_opps if c.get("time") == new_ts_found]
 
-                bar_all_opps = p_opps + v_opps + c_curr
-                print(f"[{bar_time_str}] 1-Min Bar Scanned. Found {len(bar_all_opps)} profitable opps (Parity={len(p_opps)}, Vert={len(v_opps)}, Cal={len(c_curr)}).")
+            bar_all_opps = p_opps + v_opps + c_curr
+            bar_time_str = new_ts_found[11:19]
+            print(f"[{bar_time_str}] Event Scanned ({new_ts_found}). Found {len(bar_all_opps)} profitable opps (Parity={len(p_opps)}, Vert={len(v_opps)}, Cal={len(c_curr)}).")
 
-                if bar_all_opps:
+            if bar_all_opps:
+                if not is_executable_market_hours(curr_bkk):
+                    print(f"[MARKET-HOURS] Outside executable trading hours ({curr_bkk.strftime('%H:%M:%S')}). Suppressing LIVE Telegram alert ({len(bar_all_opps)} opps held).")
+                else:
                     alertable = cooldown.filter_alertable(bar_all_opps, curr_bkk)
                     if alertable:
-                        print(f"[TELEGRAM] 🚨 Dispatching LIVE 1-Min Alert for {len(alertable)} opportunities...")
+                        print(f"[TELEGRAM] 🚨 Dispatching LIVE Event Alert for {len(alertable)} opportunities...")
                         live_msg = format_live_1min_alert(
                             trade_date=trade_date,
                             bar_ts=bar_time_str,
@@ -1548,17 +1697,9 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                             send_telegram_alert(tg_token, tg_chat_id, live_msg)
                     else:
                         print(f"[COOLDOWN] {len(bar_all_opps)} opps detected but held in anti-spam cooldown.")
-        else:
-            print(f"[{curr_bkk.strftime('%H:%M:%S')}] No new bar detected during minute window.")
 
-        # Standby until next minute's second :06
-        now_post = datetime.datetime.now(BANGKOK_TZ)
-        if now_post.time() >= session_end_time:
-            break
-        sec_to_next = 60 - now_post.second + 6
-        if sec_to_next > 60:
-            sec_to_next -= 60
-        pytime.sleep(max(1.0, sec_to_next))
+        # Event-driven polling interval: 5 seconds
+        pytime.sleep(5)
 
     # --------------------------------------------------------------------------
     # Final Session Summary Execution
