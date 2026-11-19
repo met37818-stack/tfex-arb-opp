@@ -328,59 +328,124 @@ def fetch_intraday_arb_dataset(
     """
     _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [ts_start, ts_end])
 
-    sql_fut = """
-    SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest 
+    sql_fut_depth = """
+    SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest, bid_vol, ask_vol
     FROM futures_snapshots 
     WHERE captured_at_bkk >= ? AND captured_at_bkk <= ? 
     ORDER BY captured_at_bkk ASC;
     """
-    _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [ts_start, ts_end])
+    try:
+        _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut_depth, [ts_start, ts_end])
+        has_fut_depth = True
+    except Exception:
+        sql_fut_fallback = """
+        SELECT captured_at_bkk, symbol, bid, ask, last, volume, open_interest 
+        FROM futures_snapshots 
+        WHERE captured_at_bkk >= ? AND captured_at_bkk <= ? 
+        ORDER BY captured_at_bkk ASC;
+        """
+        _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut_fallback, [ts_start, ts_end])
+        has_fut_depth = False
 
-    sql_opt = """
-    SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest 
+    sql_opt_depth = """
+    SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest, bid_vol, ask_vol
     FROM options_snapshots 
     WHERE captured_at_bkk >= ? AND captured_at_bkk <= ? 
     ORDER BY captured_at_bkk ASC;
     """
-    _, rows_opt = execute_turso_sql(pipeline_url, auth_token, sql_opt, [ts_start, ts_end])
+    try:
+        _, rows_opt = execute_turso_sql(pipeline_url, auth_token, sql_opt_depth, [ts_start, ts_end])
+        has_opt_depth = True
+    except Exception:
+        sql_opt_fallback = """
+        SELECT captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest 
+        FROM options_snapshots 
+        WHERE captured_at_bkk >= ? AND captured_at_bkk <= ? 
+        ORDER BY captured_at_bkk ASC;
+        """
+        _, rows_opt = execute_turso_sql(pipeline_url, auth_token, sql_opt_fallback, [ts_start, ts_end])
+        has_opt_depth = False
+
+    # AS-OF Continuous Forward-Fill Engine
+    # 1. Bucket raw updates chronologically into 1-minute time windows
+    spot_by_minute: Dict[str, List[Any]] = {}
+    for r in rows_spot:
+        ts = str(r[0])
+        m_key = ts[:16] + ":00" if len(ts) >= 16 else ts
+        spot_by_minute.setdefault(m_key, []).append(r)
+
+    fut_by_minute: Dict[str, List[Any]] = {}
+    for r in rows_fut:
+        ts = str(r[0])
+        m_key = ts[:16] + ":00" if len(ts) >= 16 else ts
+        fut_by_minute.setdefault(m_key, []).append(r)
+
+    opt_by_minute: Dict[str, List[Any]] = {}
+    for r in rows_opt:
+        ts = str(r[0])
+        m_key = ts[:16] + ":00" if len(ts) >= 16 else ts
+        opt_by_minute.setdefault(m_key, []).append(r)
+
+    all_minutes = sorted(list(set(spot_by_minute.keys()) | set(fut_by_minute.keys()) | set(opt_by_minute.keys())))
+
+    running_spot: Optional[float] = None
+    running_futures: Dict[str, Dict[str, Any]] = {}
+    running_options: Dict[Tuple[str, float, str], Dict[str, Any]] = {}
 
     grouped: Dict[str, Dict[str, Any]] = {}
 
-    for r in rows_spot:
-        ts = str(r[0])
-        if ts not in grouped:
-            grouped[ts] = {"spot": None, "futures": {}, "options": {}}
-        if r[1] is not None:
-            grouped[ts]["spot"] = float(r[1])
+    for m_ts in all_minutes:
+        # Update spot
+        if m_ts in spot_by_minute:
+            for r in spot_by_minute[m_ts]:
+                if r[1] is not None:
+                    running_spot = float(r[1])
 
-    for r in rows_fut:
-        ts, sym, bid, ask, last, vol, oi = r[0], r[1], r[2], r[3], r[4], r[5], r[6]
-        if ts not in grouped:
-            grouped[ts] = {"spot": None, "futures": {}, "options": {}}
-        grouped[ts]["futures"][sym] = {
-            "symbol": sym,
-            "bid": float(bid) if bid is not None else None,
-            "ask": float(ask) if ask is not None else None,
-            "last": float(last) if last is not None else None,
-            "volume": float(vol) if vol is not None else 0.0,
-            "oi": float(oi) if oi is not None else 0.0
-        }
+        # Update futures (forward-fill unchanged contracts)
+        if m_ts in fut_by_minute:
+            for r in fut_by_minute[m_ts]:
+                sym = str(r[1])
+                bid, ask, last, vol, oi = r[2], r[3], r[4], r[5], r[6]
+                bid_vol = float(r[7]) if (has_fut_depth and len(r) > 7 and r[7] is not None) else 0.0
+                ask_vol = float(r[8]) if (has_fut_depth and len(r) > 8 and r[8] is not None) else 0.0
+                running_futures[sym] = {
+                    "symbol": sym,
+                    "bid": float(bid) if bid is not None else None,
+                    "ask": float(ask) if ask is not None else None,
+                    "bid_vol": bid_vol,
+                    "ask_vol": ask_vol,
+                    "last": float(last) if last is not None else None,
+                    "volume": float(vol) if vol is not None else 0.0,
+                    "oi": float(oi) if oi is not None else 0.0
+                }
 
-    for r in rows_opt:
-        ts, sym, series, strike, otype, bid, ask, last, vol, oi = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
-        if ts not in grouped:
-            grouped[ts] = {"spot": None, "futures": {}, "options": {}}
-        key = (series, float(strike), str(otype).upper())
-        grouped[ts]["options"][key] = {
-            "symbol": sym,
-            "series": series,
-            "strike": float(strike),
-            "option_type": str(otype).upper(),
-            "bid": float(bid) if bid is not None else None,
-            "ask": float(ask) if ask is not None else None,
-            "last": float(last) if last is not None else None,
-            "volume": float(vol) if vol is not None else 0.0,
-            "oi": float(oi) if oi is not None else 0.0
+        # Update options (forward-fill unchanged contracts)
+        if m_ts in opt_by_minute:
+            for r in opt_by_minute[m_ts]:
+                sym, series, strike, otype = r[1], r[2], r[3], r[4]
+                bid, ask, last, vol, oi = r[5], r[6], r[7], r[8], r[9]
+                bid_vol = float(r[10]) if (has_opt_depth and len(r) > 10 and r[10] is not None) else 0.0
+                ask_vol = float(r[11]) if (has_opt_depth and len(r) > 11 and r[11] is not None) else 0.0
+                key = (str(series), float(strike), str(otype).upper())
+                running_options[key] = {
+                    "symbol": str(sym),
+                    "series": str(series),
+                    "strike": float(strike),
+                    "option_type": str(otype).upper(),
+                    "bid": float(bid) if bid is not None else None,
+                    "ask": float(ask) if ask is not None else None,
+                    "bid_vol": bid_vol,
+                    "ask_vol": ask_vol,
+                    "last": float(last) if last is not None else None,
+                    "volume": float(vol) if vol is not None else 0.0,
+                    "oi": float(oi) if oi is not None else 0.0
+                }
+
+        # Snapshot current AS-OF continuous state for this minute
+        grouped[m_ts] = {
+            "spot": running_spot,
+            "futures": {k: dict(v) for k, v in running_futures.items()},
+            "options": {k: dict(v) for k, v in running_options.items()}
         }
 
     return grouped, len(rows_fut), len(rows_opt)
@@ -451,7 +516,23 @@ def scan_put_call_parity(
 
             c_mid = (c_bid + c_ask) / 2.0
             p_mid = (p_bid + p_ask) / 2.0
-            max_sets = int(min(c_vol, p_vol, f_vol)) if (c_vol > 0 and p_vol > 0 and f_vol > 0) else 1
+            c_bvol = c_quote.get("bid_vol", 0.0) or 0.0
+            c_avol = c_quote.get("ask_vol", 0.0) or 0.0
+            p_bvol = p_quote.get("bid_vol", 0.0) or 0.0
+            p_avol = p_quote.get("ask_vol", 0.0) or 0.0
+            f_bvol = fut.get("bid_vol", 0.0) or 0.0
+            f_avol = fut.get("ask_vol", 0.0) or 0.0
+
+            if c_bvol > 0 and p_avol > 0 and f_avol > 0:
+                max_sets_conv = int(min(c_bvol, p_avol, f_avol))
+            else:
+                max_sets_conv = int(min(c_vol, p_vol, f_vol)) if (c_vol > 0 and p_vol > 0 and f_vol > 0) else 1
+
+            if c_avol > 0 and p_bvol > 0 and f_bvol > 0:
+                max_sets_rev = int(min(c_avol, p_bvol, f_bvol))
+            else:
+                max_sets_rev = int(min(c_vol, p_vol, f_vol)) if (c_vol > 0 and p_vol > 0 and f_vol > 0) else 1
+
             liq_tag = "[Liquid: Spot±30]" if abs(k - ref_price) <= 30.0 else "[Deep Strike: ถือจนหมดอายุ]"
 
             # 1. Conversion: (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
@@ -483,7 +564,7 @@ def scan_put_call_parity(
                     "mid_edge": mid_edge_conv,
                     "spread_cost": spread_cost_conv,
                     "commission_pts": COMMISSION,
-                    "max_sets": max_sets,
+                    "max_sets": max_sets_conv,
                     "legs": [
                         f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Vol: {c_vol:,.0f})",
                         f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Vol: {p_vol:,.0f})",
@@ -527,7 +608,7 @@ def scan_put_call_parity(
                     "mid_edge": mid_edge_rev,
                     "spread_cost": spread_cost_rev,
                     "commission_pts": COMMISSION,
-                    "max_sets": max_sets,
+                    "max_sets": max_sets_rev,
                     "legs": [
                         f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Vol: {c_vol:,.0f})",
                         f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Vol: {p_vol:,.0f})",
@@ -588,7 +669,12 @@ def scan_vertical_spreads(
                 net = gross - COMMISSION
                 spread_cost = mid_edge - gross
                 v_c1, v_c2 = c1.get("volume", 0.0), c2.get("volume", 0.0)
-                max_sets = int(min(v_c1, v_c2)) if (v_c1 > 0 and v_c2 > 0) else 1
+                v_c1_ask = c1.get("ask_vol", 0.0) or 0.0
+                v_c2_bid = c2.get("bid_vol", 0.0) or 0.0
+                if v_c1_ask > 0 and v_c2_bid > 0:
+                    max_sets = int(min(v_c1_ask, v_c2_bid))
+                else:
+                    max_sets = int(min(v_c1, v_c2)) if (v_c1 > 0 and v_c2 > 0) else 1
 
                 item = {
                     "strategy": "Call Monotonicity Violation",
@@ -644,7 +730,12 @@ def scan_vertical_spreads(
                 net = gross - COMMISSION
                 spread_cost = mid_edge - gross
                 v_p1, v_p2 = p1.get("volume", 0.0), p2.get("volume", 0.0)
-                max_sets = int(min(v_p1, v_p2)) if (v_p1 > 0 and v_p2 > 0) else 1
+                v_p2_ask = p2.get("ask_vol", 0.0) or 0.0
+                v_p1_bid = p1.get("bid_vol", 0.0) or 0.0
+                if v_p2_ask > 0 and v_p1_bid > 0:
+                    max_sets = int(min(v_p2_ask, v_p1_bid))
+                else:
+                    max_sets = int(min(v_p1, v_p2)) if (v_p1 > 0 and v_p2 > 0) else 1
 
                 item = {
                     "strategy": "Put Monotonicity Violation",
