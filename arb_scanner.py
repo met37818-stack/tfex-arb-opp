@@ -1854,77 +1854,106 @@ def format_live_1min_alert(
     T_years: float,
     thor_tenor: str = ""
 ) -> str:
-    """Formats instant real-time Telegram alert for 1-minute detected arbitrage opportunities with complete execution details."""
+    """
+    Formats instant real-time Telegram alert for 1-minute detected arbitrage opportunities.
+    Compact design (< 3,800 chars):
+    - Header: 🚨 LIVE ARB ALERT (HH:MM:SS | พบ N โอกาส)
+    - Rank #1: Full execution details with legs ordered from thinnest to thickest liquidity + 📋 Log line.
+    - Rank #2+: Compact 2 lines per opportunity (Line 1: Summary, Line 2: All legs on single line).
+    - Safe Truncation: Truncates cleanly at 3,600 chars limit with notice of remaining opps.
+    """
+    if not profitable_opps:
+        return ""
+
+    ranked = sorted(profitable_opps, key=lambda x: x.get("net_pts", 0.0), reverse=True)
+    total_cnt = len(ranked)
+
+    tenor_str = f" ({thor_tenor})" if thor_tenor else ""
     header = (
-        f"🚨 <b>[LIVE ARBITRAGE ALERT] ตรวจพบโอกาสทำกำไรทันที!</b>\n"
-        f"📅 <i>ข้อมูลวันที่ {trade_date} | เวลา <code>{bar_ts} น.</code></i>\n"
+        f"🚨 <b>LIVE ARB ALERT</b> (<code>{bar_ts} น.</code> | พบ {total_cnt} โอกาส)\n"
+        f"📅 <i>{trade_date} | THOR{tenor_str}: {thor_rate*100.0:.2f}% | DTE: {dte} วัน</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    ranked = sorted(profitable_opps, key=lambda x: x["net_pts"], reverse=True)
-    top_3 = ranked[:3]
-
-    parity_cnt = sum(1 for x in profitable_opps if "Conversion" in x["strategy"] or "Reversal" in x["strategy"])
-    vertical_cnt = sum(1 for x in profitable_opps if "Monotonicity" in x["strategy"])
-    calendar_cnt = sum(1 for x in profitable_opps if "Calendar" in x["strategy"])
-
-    tenor_str = f" ({thor_tenor})" if thor_tenor else ""
-    meta_stats = (
-        f"• <b>อัตราดอกเบี้ย THOR{tenor_str}:</b> {thor_rate*100.0:.2f}% | <b>DTE คงเหลือ:</b> {dte} วัน\n"
-        f"• <b>ตรวจพบ:</b> {len(profitable_opps)} รายการ (Parity: {parity_cnt}, Vertical: {vertical_cnt}, Calendar: {calendar_cnt})"
+    footer = (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <i>TFEX Live 1-Min Radar | Smart Cooldown 15 นาทีต่อคู่สัญญา</i>"
     )
 
-    summary_sec = (
-        f"⚡ <b>พบสัญญาณเคาะกำไรสุทธิ (Real-time Execution):</b>\n"
-        f"{meta_stats}\n"
-        f"───────────────────────\n"
-        f"🏆 <b>โอกาสทำกำไรสูงสุด (Strict Executable Prices):</b>\n"
-    )
+    def _is_fut(leg: Dict[str, Any]) -> bool:
+        if "is_futures" in leg:
+            return bool(leg["is_futures"])
+        sym = str(leg.get("symbol", ""))
+        return not bool(re.search(r"[CP]\d+$", sym))
 
-    medals = ["🥇 [1]", "🥈 [2]", "🥉 [3]"]
-    opp_blocks = []
-    for idx, opp in enumerate(top_3):
-        medal = medals[idx] if idx < len(medals) else f"• [{idx+1}]"
-        gross_pts = opp["gross_pts"]
-        comm_pts = opp["commission_pts"]
-        net_pts = opp["net_pts"]
-        gross_thb_set = gross_pts * CONTRACT_MULTIPLIER
-        comm_thb_set = comm_pts * CONTRACT_MULTIPLIER
-        net_thb_per_set = net_pts * CONTRACT_MULTIPLIER
-        m_sets = opp["max_sets"]
-        tot_thb = net_thb_per_set * m_sets if m_sets > 0 else net_thb_per_set
+    def _format_legs_rank1(opp: Dict[str, Any]) -> List[str]:
+        legs = opp.get("order_legs") or resolve_order_legs(opp)
+        sorted_legs = sorted(legs, key=lambda x: (1 if _is_fut(x) else 0, float(x.get("depth", 0.0))))
+        lines = []
+        for leg in sorted_legs:
+            side = "L" if str(leg.get("side", "")).upper() in ("L", "BUY", "LONG") else "S"
+            sym = leg.get("symbol", "")
+            p = float(leg.get("price", 0.0))
+            d = float(leg.get("depth", 0.0))
+            lines.append(f"• {side} {sym} @ {p:.2f} (Vol {d:,.0f})")
+        return lines
 
-        action_checklist = "\n".join([f"    {format_action_leg(leg)}" for leg in opp["legs"]])
-        legs_count = len(opp["legs"])
-        stats_line = f"\n  📊 <b>สถิติสเปรด:</b> <i>{opp['stats']}</i>" if "stats" in opp else ""
+    def _format_opp_rank1(opp: Dict[str, Any]) -> str:
+        strat = opp.get("strategy", "Arb")
+        target = opp.get("target", "")
+        net_pts = float(opp.get("net_pts", 0.0))
+        net_thb = net_pts * CONTRACT_MULTIPLIER
+        max_sets = int(opp.get("max_sets", 1))
 
-        block = (
-            f"{medal} <b>{opp['strategy']}</b>\n"
-            f"  📌 <b>เป้าหมาย:</b> <code>{opp['target']}</code> {opp.get('tag', '')}\n"
-            f"  ⏱ <b>เวลาตรวจพบ:</b> <code>{opp['time']} น.</code>\n\n"
-            f"  👉 <b>ขั้นตอนส่งคำสั่งทันที (Execution Checklist):</b>\n"
-            f"{action_checklist}\n\n"
-            f"  💵 <b>โครงสร้างต้นทุนและกำไร (Financial Breakdown):</b>\n"
-            f"    • <b>กำไรส่วนต่างขั้นต้น (Gross):</b> <code>+{gross_pts:.2f} จุด</code> (+{gross_thb_set:,.0f} บาท/ชุด)\n"
-            f"    • <b>หักค่าคอมมิชชัน ({legs_count} ขา @ 40 บ.):</b> <code>-{comm_pts:.2f} จุด</code> (-{comm_thb_set:,.0f} บาท/ชุด)\n"
-            f"    • <b>กำไรสุทธิคงเหลือ (Net Profit):</b> 🟢 <b>+{net_pts:.2f} จุด (+{net_thb_per_set:,.0f} บาท/ชุด)</b>\n"
-            f"    • <b>สภาพคล่องที่เคาะได้ทันที:</b> <b>{m_sets}</b> สัญญา (อิง Minimum Leg Depth)\n"
-            f"    • <b>มูลค่ากำไรสุทธิรวมทั้งพอร์ต:</b> 💰 <b>+{tot_thb:,.0f} บาท</b>{stats_line}"
+        legs_lines = _format_legs_rank1(opp)
+        log_line = format_trade_log_line(opp)
+
+        return (
+            f"<b>#1 {strat}</b> <code>{target}</code> | Net: 🟢 <b>+{net_pts:.2f} จุด (+{net_thb:,.0f} บ.)</b> | Max: <b>{max_sets}</b> ชุด (REST Verified ✅)\n"
+            + "\n".join(legs_lines) + "\n"
+            + f"<code>{log_line}</code>"
         )
-        opp_blocks.append(block)
 
-    content = summary_sec + "\n\n".join(opp_blocks)
+    def _format_opp_compact(idx: int, opp: Dict[str, Any]) -> str:
+        strat = opp.get("strategy", "Arb")
+        target = opp.get("target", "")
+        net_pts = float(opp.get("net_pts", 0.0))
+        net_thb = net_pts * CONTRACT_MULTIPLIER
+        max_sets = int(opp.get("max_sets", 1))
 
-    top_1 = top_3[0] if top_3 else None
-    log_line = format_trade_log_line(top_1) if top_1 else ""
+        line1 = f"<b>#{idx} {strat}</b> <code>{target}</code> | Net: <b>+{net_pts:.2f} จุด (+{net_thb:,.0f} บ.)</b> | Max: {max_sets} ชุด"
 
-    footer_parts = ["━━━━━━━━━━━━━━━━━━━━━━"]
-    if log_line:
-        footer_parts.append(f"<code>{log_line}</code>")
-    footer_parts.append("⚡ <i>TFEX Live 1-Min Radar | Smart Cooldown 15 นาทีต่อคู่สัญญา</i>")
-    footer = "\n".join(footer_parts)
+        legs = opp.get("order_legs") or resolve_order_legs(opp)
+        sorted_legs = sorted(legs, key=lambda x: (1 if _is_fut(x) else 0, float(x.get("depth", 0.0))))
+        legs_strs = []
+        for leg in sorted_legs:
+            side = "L" if str(leg.get("side", "")).upper() in ("L", "BUY", "LONG") else "S"
+            sym = leg.get("symbol", "")
+            p = float(leg.get("price", 0.0))
+            d = float(leg.get("depth", 0.0))
+            legs_strs.append(f"{side} {sym} @ {p:.2f} (Vol {d:,.0f})")
+        line2 = "• " + " | ".join(legs_strs)
 
-    return f"{header}\n\n{content}\n\n{footer}"
+        return f"{line1}\n{line2}"
+
+    # Build Rank #1 block
+    body_blocks = [_format_opp_rank1(ranked[0])]
+    truncated_count = 0
+
+    # Build Rank #2+ blocks with Safe Truncation (< 3,600 chars limit)
+    for idx, opp in enumerate(ranked[1:], start=2):
+        opp_str = _format_opp_compact(idx, opp)
+        remaining_after = total_cnt - idx
+        test_trunc_notice = f"\n\n<i>...และอีก {remaining_after} โอกาส (ดูเพิ่มในสรุปปิดรอบ)</i>" if remaining_after > 0 else ""
+        tentative_msg = f"{header}\n\n" + "\n\n".join(body_blocks + [opp_str]) + test_trunc_notice + f"\n\n{footer}"
+
+        if len(tentative_msg) > 3600:
+            truncated_count = total_cnt - (idx - 1)
+            break
+        body_blocks.append(opp_str)
+
+    trunc_notice = f"\n\n<i>...และอีก {truncated_count} โอกาส (ดูเพิ่มในสรุปปิดรอบ)</i>" if truncated_count > 0 else ""
+    return f"{header}\n\n" + "\n\n".join(body_blocks) + trunc_notice + f"\n\n{footer}"
 
 
 def compute_best_of_minute_stats(

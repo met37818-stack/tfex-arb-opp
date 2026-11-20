@@ -476,6 +476,147 @@ class TestStreamingMultiOrder(unittest.TestCase):
         # In-memory cache is updated with new price 25.20
         self.assertEqual(running_options[("Z26", 920.0, "C")]["bid"], 25.20)
 
+    def test_format_live_1min_alert_multi_opps_full(self):
+        """
+        Tests format_live_1min_alert with multiple opportunities (5 opportunities):
+        - Header shows 🚨 LIVE ARB ALERT (HH:MM:SS | พบ 5 โอกาส)
+        - Rank #1 has (REST Verified ✅), 1 line per leg, and <code>📋 Log: ...</code>
+        - Rank #2+ has compact 2 lines (Line 1: Summary, Line 2: All legs on single line)
+        - All 5 opportunities are included completely
+        - Total message length < 3,800 characters
+        """
+        opps = [
+            {
+                "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
+                "target": "Strike 920 & S50Z26",
+                "net_pts": 1.80,
+                "max_sets": 5,
+                "order_legs": [
+                    {"symbol": "S50Z26C920", "side": "S", "price": 22.50, "depth": 15.0, "is_futures": False},
+                    {"symbol": "S50Z26P920", "side": "L", "price": 15.00, "depth": 5.0, "is_futures": False},
+                    {"symbol": "S50Z26", "side": "L", "price": 920.00, "depth": 50.0, "is_futures": True}
+                ]
+            },
+            {
+                "strategy": "Call Monotonicity Violation",
+                "target": "Call 910/920 (Z26)",
+                "net_pts": 1.60,
+                "max_sets": 8,
+                "order_legs": [
+                    {"symbol": "S50Z26C910", "side": "L", "price": 25.00, "depth": 10.0, "is_futures": False},
+                    {"symbol": "S50Z26C920", "side": "S", "price": 27.00, "depth": 8.0, "is_futures": False}
+                ]
+            },
+            {
+                "strategy": "Put Monotonicity Violation",
+                "target": "Put 920/930 (Z26)",
+                "net_pts": 1.40,
+                "max_sets": 6,
+                "order_legs": [
+                    {"symbol": "S50Z26P920", "side": "S", "price": 16.00, "depth": 6.0, "is_futures": False},
+                    {"symbol": "S50Z26P930", "side": "L", "price": 14.20, "depth": 12.0, "is_futures": False}
+                ]
+            },
+            {
+                "strategy": "Calendar Spread Spike (Overextended High)",
+                "target": "S50Z26 - S50H27",
+                "net_pts": 1.20,
+                "max_sets": 15,
+                "order_legs": [
+                    {"symbol": "S50Z26", "side": "S", "price": 925.00, "depth": 20.0, "is_futures": True},
+                    {"symbol": "S50H27", "side": "L", "price": 921.00, "depth": 15.0, "is_futures": True}
+                ]
+            },
+            {
+                "strategy": "Reversal (Buy C, Sell P, Sell Fut)",
+                "target": "Strike 930 & S50Z26",
+                "net_pts": 0.90,
+                "max_sets": 4,
+                "order_legs": [
+                    {"symbol": "S50Z26C930", "side": "L", "price": 12.00, "depth": 4.0, "is_futures": False},
+                    {"symbol": "S50Z26P930", "side": "S", "price": 18.50, "depth": 10.0, "is_futures": False},
+                    {"symbol": "S50Z26", "side": "S", "price": 920.00, "depth": 30.0, "is_futures": True}
+                ]
+            }
+        ]
+
+        msg = format_live_1min_alert(
+            trade_date="2026-11-20",
+            bar_ts="10:15:00",
+            profitable_opps=opps,
+            thor_rate=0.0225,
+            dte=35,
+            T_years=35 / 365.0
+        )
+
+        # 1. Header checks
+        self.assertIn("🚨 <b>LIVE ARB ALERT</b> (<code>10:15:00 น.</code> | พบ 5 โอกาส)", msg)
+
+        # 2. Rank #1 checks
+        self.assertIn("#1 Conversion (Sell C, Buy P, Buy Fut)", msg)
+        self.assertIn("(REST Verified ✅)", msg)
+        self.assertIn("• L S50Z26P920 @ 15.00 (Vol 5)", msg)
+        self.assertIn("• S S50Z26C920 @ 22.50 (Vol 15)", msg)
+        self.assertIn("• L S50Z26 @ 920.00 (Vol 50)", msg)
+        self.assertIn("<code>📋 Log: Conversion | S50Z26C920 S 22.50 | S50Z26P920 L 15.00 | S50Z26 L 920.00 | +360</code>", msg)
+
+        # 3. Rank #2+ checks (compact format)
+        self.assertIn("<b>#2 Call Monotonicity Violation</b>", msg)
+        self.assertIn("• S S50Z26C920 @ 27.00 (Vol 8) | L S50Z26C910 @ 25.00 (Vol 10)", msg)
+
+        self.assertIn("<b>#3 Put Monotonicity Violation</b>", msg)
+        self.assertIn("• S S50Z26P920 @ 16.00 (Vol 6) | L S50Z26P930 @ 14.20 (Vol 12)", msg)
+
+        self.assertIn("<b>#4 Calendar Spread Spike (Overextended High)</b>", msg)
+        self.assertIn("• L S50H27 @ 921.00 (Vol 15) | S S50Z26 @ 925.00 (Vol 20)", msg)
+
+        self.assertIn("<b>#5 Reversal (Buy C, Sell P, Sell Fut)</b>", msg)
+        self.assertIn("• L S50Z26C930 @ 12.00 (Vol 4) | S S50Z26P930 @ 18.50 (Vol 10) | S S50Z26 @ 920.00 (Vol 30)", msg)
+
+        # 4. Message length limit
+        self.assertLess(len(msg), 3800)
+
+    def test_format_live_1min_alert_safe_truncation_large_opps(self):
+        """
+        Tests safe truncation when there are 40 opportunities:
+        - Must truncate before 3,600 characters
+        - Must include notice: ...และอีก X โอกาส (ดูเพิ่มในสรุปปิดรอบ)
+        - Must never exceed 3,800 characters
+        """
+        opps = []
+        for i in range(40):
+            k = 900.0 + i
+            opps.append({
+                "strategy": "Call Monotonicity Violation",
+                "target": f"Call {k:.0f}/{k+10:.0f} (Z26)",
+                "net_pts": 2.0 - i * 0.02,
+                "max_sets": 5,
+                "order_legs": [
+                    {"symbol": f"S50Z26C{k:.0f}", "side": "L", "price": 25.0, "depth": 10.0, "is_futures": False},
+                    {"symbol": f"S50Z26C{k+10:.0f}", "side": "S", "price": 27.4, "depth": 5.0, "is_futures": False}
+                ]
+            })
+
+        msg = format_live_1min_alert(
+            trade_date="2026-11-20",
+            bar_ts="10:15:00",
+            profitable_opps=opps,
+            thor_rate=0.0225,
+            dte=35,
+            T_years=35 / 365.0
+        )
+
+        # Header indicates 40 found
+        self.assertIn("พบ 40 โอกาส", msg)
+        # Rank #1 is always intact
+        self.assertIn("#1 Call Monotonicity Violation", msg)
+        self.assertIn("(REST Verified ✅)", msg)
+        # Truncation notice must be present
+        self.assertIn("...และอีก", msg)
+        self.assertIn("โอกาส (ดูเพิ่มในสรุปปิดรอบ)", msg)
+        # Message length strictly below safe ceiling 3,800
+        self.assertLess(len(msg), 3800)
+
 
 if __name__ == "__main__":
     unittest.main()
