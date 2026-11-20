@@ -47,6 +47,12 @@ import pandas as pd
 import openpyxl
 from dotenv import load_dotenv
 
+try:
+    from settrade_v2 import Investor, config as settrade_config
+except ImportError:
+    Investor = None
+    settrade_config = None
+
 load_dotenv()
 
 BANGKOK_TZ = pytz.timezone("Asia/Bangkok")
@@ -589,6 +595,7 @@ def scan_put_call_parity(
                         "spread_cost": spread_cost_conv,
                         "commission_pts": COMMISSION,
                         "max_sets": max_sets_conv,
+                        "disc_factor": disc_factor,
                         "legs": [
                             f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Depth: {c_bvol:,.0f})",
                             f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Depth: {p_avol:,.0f})",
@@ -641,6 +648,7 @@ def scan_put_call_parity(
                         "spread_cost": spread_cost_rev,
                         "commission_pts": COMMISSION,
                         "max_sets": max_sets_rev,
+                        "disc_factor": disc_factor,
                         "legs": [
                             f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Depth: {c_avol:,.0f})",
                             f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Depth: {p_bvol:,.0f})",
@@ -905,6 +913,8 @@ def scan_calendar_spreads(
             "spread_cost": spread_cost_up,
             "commission_pts": COMMISSION,
             "max_sets": max_sets_up,
+            "mu": mu,
+            "std": std,
             "legs": [
                 f"Sell Front {f1_sym} @ Bid <code>{b1:.2f}</code> (Depth: {b1_vol:,.0f})",
                 f"Buy Next {f2_sym} @ Ask <code>{a2:.2f}</code> (Depth: {a2_vol:,.0f})"
@@ -949,6 +959,8 @@ def scan_calendar_spreads(
             "spread_cost": spread_cost_down,
             "commission_pts": COMMISSION,
             "max_sets": max_sets_down,
+            "mu": mu,
+            "std": std,
             "legs": [
                 f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Depth: {a1_vol:,.0f})",
                 f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Depth: {b2_vol:,.0f})"
@@ -1176,6 +1188,470 @@ def generate_streaming_multi_order_xlsx(opp: Dict[str, Any]) -> Tuple[bytes, str
     filename = f"ARB_{clean_strat}_{clean_target}_{time_tag}.xlsx"
 
     return file_bytes, filename
+
+
+def format_trade_log_line(opp: Dict[str, Any]) -> str:
+    """
+    Formats a single-line summary for copying into Excel Trade_Log.
+    Format:
+    📋 Log: {Strategy} | {Leg1_Sym} {Side1} {Price1:.2f} | {Leg2_Sym} {Side2} {Price2:.2f} [| {Leg3_Sym} {Side3} {Price3:.2f}] | +{NetTHB:.0f}
+    """
+    strat = opp.get("strategy", "Arb")
+    strat_clean = strat.split("(")[0].strip() or strat
+
+    legs = opp.get("order_legs") or resolve_order_legs(opp)
+    legs_parts = []
+    for leg in legs:
+        sym = leg.get("symbol", "")
+        side = str(leg.get("side", "")).upper()
+        price = float(leg.get("price", 0.0))
+        legs_parts.append(f"{sym} {side} {price:.2f}")
+
+    net_pts = float(opp.get("net_pts", 0.0))
+    net_thb = net_pts * CONTRACT_MULTIPLIER
+    net_thb_str = f"+{net_thb:.0f}" if net_thb >= 0 else f"{net_thb:.0f}"
+
+    parts = [f"📋 Log: {strat_clean}"] + legs_parts + [net_thb_str]
+    return " | ".join(parts)
+
+
+_SETTRADE_INVESTOR = None
+_SETTRADE_MARKET_DATA = None
+
+
+def get_settrade_market_data(
+    app_id: Optional[str] = None,
+    app_secret: Optional[str] = None,
+    broker_id: Optional[str] = None,
+    app_code: Optional[str] = None,
+    is_sandbox: Optional[bool] = None
+) -> Any:
+    """
+    Initializes and caches Settrade Open API MarketData client using environment variables.
+    Returns None if credentials are missing or settrade_v2 is unavailable.
+    """
+    global _SETTRADE_INVESTOR, _SETTRADE_MARKET_DATA
+    if _SETTRADE_MARKET_DATA is not None:
+        return _SETTRADE_MARKET_DATA
+
+    app_id = app_id or os.getenv("SETTRADE_APP_ID", "").strip()
+    app_secret = app_secret or os.getenv("SETTRADE_APP_SECRET", "").strip()
+    broker_id = broker_id or os.getenv("SETTRADE_BROKER_ID", "").strip()
+    app_code = app_code or os.getenv("SETTRADE_APP_CODE", "ALGO").strip() or "ALGO"
+
+    if is_sandbox is None:
+        is_sb_str = os.getenv("SETTRADE_IS_SANDBOX", "false").strip().lower()
+        is_sandbox = is_sb_str in ("1", "true", "yes")
+
+    if not app_id or not app_secret or not broker_id:
+        return None
+
+    if Investor is None:
+        print("[SETTRADE] settrade_v2 library is not available.")
+        return None
+
+    try:
+        broker = broker_id
+        if is_sandbox:
+            if settrade_config is not None:
+                settrade_config["environment"] = "uat"
+            if not broker or broker.upper() == "SANDBOX":
+                broker = Investor.SANDBOX
+
+        _SETTRADE_INVESTOR = Investor(
+            app_id=app_id,
+            app_secret=app_secret,
+            broker_id=broker,
+            app_code=app_code,
+            is_auto_queue=False
+        )
+        _SETTRADE_MARKET_DATA = _SETTRADE_INVESTOR.MarketData()
+        print("[SETTRADE] MarketData initialized successfully for REST verification.")
+        return _SETTRADE_MARKET_DATA
+    except Exception as e:
+        print(f"[SETTRADE] Initialization failed: {e}")
+        return None
+
+
+def extract_rest_quote_depth(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extracts bid, ask, bid_vol, ask_vol, last, volume from Settrade REST quote dictionary.
+    Supports both flat keys and nested bids/asks lists.
+    """
+    if not isinstance(raw, dict):
+        return {
+            "bid": None, "ask": None, "bid_vol": 0.0, "ask_vol": 0.0,
+            "last": None, "volume": 0.0
+        }
+
+    bid = raw.get("bid") or raw.get("bid_price1") or raw.get("bidPrice1") or raw.get("best_bid")
+    ask = raw.get("ask") or raw.get("ask_price1") or raw.get("askPrice1") or raw.get("offer") or raw.get("best_ask")
+    bid_vol = raw.get("bid_vol") or raw.get("bid_volume1") or raw.get("bidVolume1") or raw.get("bid_size")
+    ask_vol = raw.get("ask_vol") or raw.get("ask_volume1") or raw.get("askVolume1") or raw.get("ask_size")
+    last = raw.get("last") or raw.get("last_price") or raw.get("lastPrice")
+    vol = raw.get("volume") or raw.get("total_volume") or raw.get("totalVolume")
+
+    if bid is None and "bids" in raw and isinstance(raw["bids"], list) and raw["bids"]:
+        bid = raw["bids"][0].get("price")
+        if bid_vol is None:
+            bid_vol = raw["bids"][0].get("volume")
+    if ask is None and "asks" in raw and isinstance(raw["asks"], list) and raw["asks"]:
+        ask = raw["asks"][0].get("price")
+        if ask_vol is None:
+            ask_vol = raw["asks"][0].get("volume")
+
+    def _to_f(v):
+        try:
+            return float(v) if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    b = _to_f(bid)
+    a = _to_f(ask)
+    bv = _to_f(bid_vol) or 0.0
+    av = _to_f(ask_vol) or 0.0
+    lp = _to_f(last)
+    tv = _to_f(vol) or 0.0
+
+    return {
+        "bid": b if (b is not None and b > 0) else None,
+        "ask": a if (a is not None and a > 0) else None,
+        "bid_vol": bv if bv > 0 else 0.0,
+        "ask_vol": av if av > 0 else 0.0,
+        "last": lp,
+        "volume": tv
+    }
+
+
+def _recalculate_opp_math(
+    opp: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    live_quotes: Dict[str, Dict[str, Any]],
+    thor_rate: Optional[float] = None,
+    T_years: Optional[float] = None
+) -> Tuple[Optional[float], Optional[float], int]:
+    """
+    Recalculates (gross_pts, net_pts, max_sets) from live quotes using exact strategy formulas.
+    """
+    strat = opp.get("strategy", "")
+    comm = float(opp.get("commission_pts", COMMISSION_2LEG_PTS if len(legs) == 2 else COMMISSION_3LEG_PTS))
+
+    # Conversion
+    if "Conversion" in strat:
+        c_leg = next((l for l in legs if not l.get("is_futures") and "C" in l["symbol"]), None)
+        p_leg = next((l for l in legs if not l.get("is_futures") and "P" in l["symbol"]), None)
+        f_leg = next((l for l in legs if l.get("is_futures")), None)
+        if not c_leg or not p_leg or not f_leg:
+            return None, None, 0
+        c_bid = live_quotes[c_leg["symbol"]]["bid"]
+        c_bvol = live_quotes[c_leg["symbol"]]["bid_vol"]
+        p_ask = live_quotes[p_leg["symbol"]]["ask"]
+        p_avol = live_quotes[p_leg["symbol"]]["ask_vol"]
+        f_ask = live_quotes[f_leg["symbol"]]["ask"]
+        f_avol = live_quotes[f_leg["symbol"]]["ask_vol"]
+        if c_bid is None or p_ask is None or f_ask is None:
+            return None, None, 0
+        k = float(opp.get("strike", 0.0))
+        disc = opp.get("disc_factor")
+        if disc is None and thor_rate is not None and T_years is not None:
+            disc = math.exp(-thor_rate * T_years)
+        if disc is None:
+            disc = 1.0
+        gross = (c_bid - p_ask) - (f_ask - k) * disc
+        net = gross - comm
+        max_sets = int(min(c_bvol, p_avol, f_avol))
+        return gross, net, max_sets
+
+    # Reversal
+    if "Reversal" in strat:
+        c_leg = next((l for l in legs if not l.get("is_futures") and "C" in l["symbol"]), None)
+        p_leg = next((l for l in legs if not l.get("is_futures") and "P" in l["symbol"]), None)
+        f_leg = next((l for l in legs if l.get("is_futures")), None)
+        if not c_leg or not p_leg or not f_leg:
+            return None, None, 0
+        c_ask = live_quotes[c_leg["symbol"]]["ask"]
+        c_avol = live_quotes[c_leg["symbol"]]["ask_vol"]
+        p_bid = live_quotes[p_leg["symbol"]]["bid"]
+        p_bvol = live_quotes[p_leg["symbol"]]["bid_vol"]
+        f_bid = live_quotes[f_leg["symbol"]]["bid"]
+        f_bvol = live_quotes[f_leg["symbol"]]["bid_vol"]
+        if c_ask is None or p_bid is None or f_bid is None:
+            return None, None, 0
+        k = float(opp.get("strike", 0.0))
+        disc = opp.get("disc_factor")
+        if disc is None and thor_rate is not None and T_years is not None:
+            disc = math.exp(-thor_rate * T_years)
+        if disc is None:
+            disc = 1.0
+        gross = (f_bid - k) * disc - (c_ask - p_bid)
+        net = gross - comm
+        max_sets = int(min(c_avol, p_bvol, f_bvol))
+        return gross, net, max_sets
+
+    # Call Monotonicity
+    if "Call Monotonicity" in strat:
+        buy_leg = next((l for l in legs if l.get("side", "").upper() in ("L", "BUY")), None)
+        sell_leg = next((l for l in legs if l.get("side", "").upper() in ("S", "SELL")), None)
+        if not buy_leg or not sell_leg:
+            return None, None, 0
+        b_ask = live_quotes[buy_leg["symbol"]]["ask"]
+        b_avol = live_quotes[buy_leg["symbol"]]["ask_vol"]
+        s_bid = live_quotes[sell_leg["symbol"]]["bid"]
+        s_bvol = live_quotes[sell_leg["symbol"]]["bid_vol"]
+        if b_ask is None or s_bid is None:
+            return None, None, 0
+        gross = s_bid - b_ask
+        net = gross - comm
+        max_sets = int(min(b_avol, s_bvol))
+        return gross, net, max_sets
+
+    # Put Monotonicity
+    if "Put Monotonicity" in strat:
+        sell_leg = next((l for l in legs if l.get("side", "").upper() in ("S", "SELL")), None)
+        buy_leg = next((l for l in legs if l.get("side", "").upper() in ("L", "BUY")), None)
+        if not sell_leg or not buy_leg:
+            return None, None, 0
+        s_bid = live_quotes[sell_leg["symbol"]]["bid"]
+        s_bvol = live_quotes[sell_leg["symbol"]]["bid_vol"]
+        b_ask = live_quotes[buy_leg["symbol"]]["ask"]
+        b_avol = live_quotes[buy_leg["symbol"]]["ask_vol"]
+        if s_bid is None or b_ask is None:
+            return None, None, 0
+        gross = s_bid - b_ask
+        net = gross - comm
+        max_sets = int(min(s_bvol, b_avol))
+        return gross, net, max_sets
+
+    # Calendar Spread Spike High
+    if "Calendar" in strat and "High" in strat:
+        sell_leg = next((l for l in legs if l.get("side", "").upper() in ("S", "SELL")), None)
+        buy_leg = next((l for l in legs if l.get("side", "").upper() in ("L", "BUY")), None)
+        if not sell_leg or not buy_leg:
+            return None, None, 0
+        s_bid = live_quotes[sell_leg["symbol"]]["bid"]
+        s_bvol = live_quotes[sell_leg["symbol"]]["bid_vol"]
+        b_ask = live_quotes[buy_leg["symbol"]]["ask"]
+        b_avol = live_quotes[buy_leg["symbol"]]["ask_vol"]
+        if s_bid is None or b_ask is None:
+            return None, None, 0
+        mu = float(opp.get("mu", 0.0))
+        exec_sell_spread = s_bid - b_ask
+        gross = exec_sell_spread - mu
+        net = gross - comm
+        max_sets = int(min(s_bvol, b_avol))
+        return gross, net, max_sets
+
+    # Calendar Spread Spike Low
+    if "Calendar" in strat and "Low" in strat:
+        buy_leg = next((l for l in legs if l.get("side", "").upper() in ("L", "BUY")), None)
+        sell_leg = next((l for l in legs if l.get("side", "").upper() in ("S", "SELL")), None)
+        if not buy_leg or not sell_leg:
+            return None, None, 0
+        b_ask = live_quotes[buy_leg["symbol"]]["ask"]
+        b_avol = live_quotes[buy_leg["symbol"]]["ask_vol"]
+        s_bid = live_quotes[sell_leg["symbol"]]["bid"]
+        s_bvol = live_quotes[sell_leg["symbol"]]["bid_vol"]
+        if b_ask is None or s_bid is None:
+            return None, None, 0
+        mu = float(opp.get("mu", 0.0))
+        exec_buy_spread = b_ask - s_bid
+        gross = mu - exec_buy_spread
+        net = gross - comm
+        max_sets = int(min(b_avol, s_bvol))
+        return gross, net, max_sets
+
+    # General 2-leg fallback
+    if len(legs) == 2:
+        buy_leg = next((l for l in legs if l.get("side", "").upper() in ("L", "BUY")), None)
+        sell_leg = next((l for l in legs if l.get("side", "").upper() in ("S", "SELL")), None)
+        if buy_leg and sell_leg:
+            b_ask = live_quotes[buy_leg["symbol"]]["ask"]
+            b_avol = live_quotes[buy_leg["symbol"]]["ask_vol"]
+            s_bid = live_quotes[sell_leg["symbol"]]["bid"]
+            s_bvol = live_quotes[sell_leg["symbol"]]["bid_vol"]
+            if b_ask is not None and s_bid is not None:
+                gross = s_bid - b_ask
+                net = gross - comm
+                max_sets = int(min(b_avol, s_bvol))
+                return gross, net, max_sets
+
+    return None, None, 0
+
+
+def verify_live_quotes_before_alert(
+    opp: Dict[str, Any],
+    market_data: Any = None,
+    running_futures: Optional[Dict[str, Dict[str, Any]]] = None,
+    running_options: Optional[Dict[Tuple[str, float, str], Dict[str, Any]]] = None,
+    thor_rate: Optional[float] = None,
+    T_years: Optional[float] = None
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Pre-Alert REST Double-Check Gate:
+    Fetches real-time live quotes (bid, ask, bid_vol, ask_vol) from Settrade REST API (get_quote_symbol)
+    for the 2-3 legs of the top opportunity before sending Telegram alert or generating .xlsx.
+
+    Rules:
+    1. Overwrites old values in running_options / running_futures immediately with fresh REST data.
+    2. Checks volume depth >= 1 for each leg and valid price.
+    3. Re-calculates net_pts after commission using live REST prices.
+    4. If net_pts > 0 and all legs have vol >= 1:
+       - Updates order_legs, legs text checklist, gross_pts, net_pts, and max_sets.
+       - Returns (True, updated_opp).
+    5. If net_pts <= 0 or any leg vol < 1:
+       - Logs [REST-GUARD] Filtered ghost/stale opportunity.
+       - Suppresses alert (returns (False, opp)).
+    """
+    if market_data is None:
+        market_data = get_settrade_market_data()
+
+    if market_data is None:
+        # No credentials configured; bypass in offline/replay mode
+        print("[REST-GUARD] Settrade MarketData not configured. Bypassing REST double-check.")
+        return True, opp
+
+    legs = resolve_order_legs(opp)
+    if not legs:
+        print("[REST-GUARD] No order legs found for opportunity. Suppressing.")
+        return False, opp
+
+    now_bkk = datetime.datetime.now(BANGKOK_TZ)
+    now_ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+
+    live_quotes: Dict[str, Dict[str, Any]] = {}
+    strat = opp.get("strategy", "")
+    target = opp.get("target", "")
+
+    # Step 1: Query REST quotes for each leg (max 3 calls)
+    for leg in legs:
+        sym = leg["symbol"]
+        try:
+            raw_quote = market_data.get_quote_symbol(sym)
+            q_data = extract_rest_quote_depth(raw_quote)
+        except Exception as e:
+            print(f"[REST-GUARD] Error fetching quote for {sym}: {e}")
+            return False, opp
+
+        live_quotes[sym] = q_data
+
+        # Update cache immediately to flush stale/ghost data
+        if leg.get("is_futures") or not re.search(r"[CP]\d+$", sym):
+            if running_futures is not None:
+                running_futures[sym] = {
+                    "symbol": sym,
+                    "bid": q_data["bid"],
+                    "ask": q_data["ask"],
+                    "bid_vol": q_data["bid_vol"],
+                    "ask_vol": q_data["ask_vol"],
+                    "last": q_data["last"],
+                    "volume": q_data["volume"],
+                    "last_update_ts": now_ts_str
+                }
+        else:
+            if running_options is not None:
+                m = re.match(r"^S50([A-Z]\d{2})([CP])(\d+)$", sym)
+                if m:
+                    ser, otype, k_str = m.groups()
+                    key = (str(ser), float(k_str), str(otype).upper())
+                    running_options[key] = {
+                        "symbol": sym,
+                        "series": str(ser),
+                        "strike": float(k_str),
+                        "option_type": str(otype).upper(),
+                        "bid": q_data["bid"],
+                        "ask": q_data["ask"],
+                        "bid_vol": q_data["bid_vol"],
+                        "ask_vol": q_data["ask_vol"],
+                        "last": q_data["last"],
+                        "volume": q_data["volume"],
+                        "last_update_ts": now_ts_str
+                    }
+
+    # Step 2: Validate execution price and depth >= 1 for each leg
+    for leg in legs:
+        sym = leg["symbol"]
+        side = str(leg.get("side", "")).upper()
+        q = live_quotes[sym]
+        if side in ("L", "BUY", "LONG"):
+            price = q["ask"]
+            vol = q["ask_vol"]
+            req_side = "Ask"
+        else:
+            price = q["bid"]
+            vol = q["bid_vol"]
+            req_side = "Bid"
+
+        if price is None or price <= 0:
+            print(f"[REST-GUARD] Filtered ghost/stale opportunity ({strat} - {target}): {sym} {req_side} price is missing/invalid ({price}).")
+            return False, opp
+
+        if vol < 1.0:
+            print(f"[REST-GUARD] Filtered ghost/stale opportunity ({strat} - {target}): {sym} {req_side} depth is 0 or depleted (vol={vol}).")
+            return False, opp
+
+    # Step 3: Recalculate net profit from live REST prices
+    gross, net, max_sets = _recalculate_opp_math(opp, legs, live_quotes, thor_rate, T_years)
+    if gross is None or net is None:
+        print(f"[REST-GUARD] Filtered ghost/stale opportunity ({strat} - {target}): Math calculation failed.")
+        return False, opp
+
+    if net <= 0.0:
+        print(f"[REST-GUARD] Filtered ghost/stale opportunity ({strat} - {target}): Recalculated net_pts={net:.2f} <= 0.")
+        return False, opp
+
+    # Step 4: Construct verified, updated opportunity
+    updated_opp = dict(opp)
+    updated_opp["gross_pts"] = gross
+    updated_opp["net_pts"] = net
+    updated_opp["max_sets"] = max_sets
+
+    updated_order_legs = []
+    updated_text_legs = []
+    for leg in legs:
+        sym = leg["symbol"]
+        side = str(leg.get("side", "")).upper()
+        is_fut = bool(leg.get("is_futures", False))
+        q = live_quotes[sym]
+        if side in ("L", "BUY", "LONG"):
+            p = q["ask"]
+            d = q["ask_vol"]
+            side_str = "L"
+            side_label = "Buy"
+            price_type = "Ask"
+        else:
+            p = q["bid"]
+            d = q["bid_vol"]
+            side_str = "S"
+            side_label = "Sell"
+            price_type = "Bid"
+
+        updated_order_legs.append({
+            "symbol": sym,
+            "side": side_str,
+            "price": p,
+            "depth": d,
+            "is_futures": is_fut
+        })
+
+        # Format text checklist leg
+        m = re.match(r"^S50([A-Z]\d{2})([CP])(\d+)$", sym)
+        if m:
+            ser, otype, k_str = m.groups()
+            opt_kind = "Call" if otype == "C" else "Put"
+            updated_text_legs.append(f"{side_label} {opt_kind} {float(k_str):.0f} @ {price_type} <code>{p:.2f}</code> (Depth: {d:,.0f})")
+        else:
+            fut_label = "Futures"
+            if "Front" in leg.get("label", "") or "f1" in sym.lower():
+                fut_label = "Front"
+            elif "Next" in leg.get("label", "") or "f2" in sym.lower():
+                fut_label = "Next"
+            updated_text_legs.append(f"{side_label} {fut_label} {sym} @ {price_type} <code>{p:.2f}</code> (Depth: {d:,.0f})")
+
+    updated_opp["order_legs"] = updated_order_legs
+    updated_opp["legs"] = updated_text_legs
+
+    print(f"[REST-GUARD] ✅ Verified live quotes via REST: {strat} {target} (Net: +{net:.2f} pts, Sets: {max_sets})")
+    return True, updated_opp
 
 
 def is_executable_market_hours(dt_or_time: Any) -> bool:
@@ -1438,10 +1914,15 @@ def format_live_1min_alert(
         opp_blocks.append(block)
 
     content = summary_sec + "\n\n".join(opp_blocks)
-    footer = (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>TFEX Live 1-Min Radar | Smart Cooldown 15 นาทีต่อคู่สัญญา</i>"
-    )
+
+    top_1 = top_3[0] if top_3 else None
+    log_line = format_trade_log_line(top_1) if top_1 else ""
+
+    footer_parts = ["━━━━━━━━━━━━━━━━━━━━━━"]
+    if log_line:
+        footer_parts.append(f"<code>{log_line}</code>")
+    footer_parts.append("⚡ <i>TFEX Live 1-Min Radar | Smart Cooldown 15 นาทีต่อคู่สัญญา</i>")
+    footer = "\n".join(footer_parts)
 
     return f"{header}\n\n{content}\n\n{footer}"
 
@@ -1825,6 +2306,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     cooldown = ArbSmartCooldown(cooldown_seconds=900, profit_hurdle_pts=0.20)
     lifespan_tracker = OpportunityLifespanTracker()
     last_heartbeat_time = pytime.time()
+    st_market_data = get_settrade_market_data()
 
     # --------------------------------------------------------------------------
     # Real-time Sub-Minute Live Loop (Polls Turso every 5 seconds)
@@ -1997,31 +2479,46 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                 else:
                     alertable = cooldown.filter_alertable(bar_all_opps, curr_bkk)
                     if alertable:
-                        print(f"[TELEGRAM] 🚨 Dispatching LIVE Event Alert for {len(alertable)} opportunities...")
-                        live_msg = format_live_1min_alert(
-                            trade_date=trade_date,
-                            bar_ts=bar_time_str,
-                            profitable_opps=alertable,
+                        ranked_alertable = sorted(alertable, key=lambda x: x.get("net_pts", 0.0), reverse=True)
+                        top_1_opp = ranked_alertable[0]
+
+                        # Pre-Alert REST Double-Check Gate
+                        verified, updated_top_1 = verify_live_quotes_before_alert(
+                            opp=top_1_opp,
+                            market_data=st_market_data,
+                            running_futures=running_futures,
+                            running_options=running_options,
                             thor_rate=thor_rate,
-                            dte=dte,
-                            T_years=T_years,
-                            thor_tenor=thor_tenor
+                            T_years=T_years
                         )
-                        if not no_telegram and tg_token and tg_chat_id:
-                            send_telegram_alert(tg_token, tg_chat_id, live_msg)
-                            # Generate & attach Settrade Streaming Multiple Order Excel file for Top 1 opportunity
-                            try:
-                                ranked_alertable = sorted(alertable, key=lambda x: x.get("net_pts", 0.0), reverse=True)
-                                top_1_opp = ranked_alertable[0]
-                                xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(top_1_opp)
-                                doc_caption = (
-                                    f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{top_1_opp['strategy']}</code> | "
-                                    f"<code>{top_1_opp['target']}</code> (Net: <b>+{top_1_opp['net_pts']:.2f} pts</b>)\n"
-                                    f"⚡ <i>นำเข้าเมนู Multiple Order บน Settrade Streaming เพื่อส่งคำสั่งพร้อมกัน</i>"
-                                )
-                                send_telegram_document(tg_token, tg_chat_id, xlsx_bytes, xlsx_filename, caption=doc_caption)
-                            except Exception as e:
-                                print(f"[EXCEL] Error generating/sending Streaming Multi-Order xlsx: {e}")
+
+                        if not verified:
+                            print(f"[REST-GUARD] Filtered ghost/stale opportunity ({top_1_opp.get('strategy')} - {top_1_opp.get('target')}). Suppressing LIVE Telegram alert.")
+                        else:
+                            ranked_alertable[0] = updated_top_1
+                            print(f"[TELEGRAM] 🚨 Dispatching LIVE Event Alert for {len(ranked_alertable)} opportunities...")
+                            live_msg = format_live_1min_alert(
+                                trade_date=trade_date,
+                                bar_ts=bar_time_str,
+                                profitable_opps=ranked_alertable,
+                                thor_rate=thor_rate,
+                                dte=dte,
+                                T_years=T_years,
+                                thor_tenor=thor_tenor
+                            )
+                            if not no_telegram and tg_token and tg_chat_id:
+                                send_telegram_alert(tg_token, tg_chat_id, live_msg)
+                                # Generate & attach Settrade Streaming Multiple Order Excel file for Top 1 opportunity
+                                try:
+                                    xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(updated_top_1)
+                                    doc_caption = (
+                                        f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{updated_top_1['strategy']}</code> | "
+                                        f"<code>{updated_top_1['target']}</code> (Net: <b>+{updated_top_1['net_pts']:.2f} pts</b>)\n"
+                                        f"⚡ <i>นำเข้าเมนู Multiple Order บน Settrade Streaming เพื่อส่งคำสั่งพร้อมกัน</i>"
+                                    )
+                                    send_telegram_document(tg_token, tg_chat_id, xlsx_bytes, xlsx_filename, caption=doc_caption)
+                                except Exception as e:
+                                    print(f"[EXCEL] Error generating/sending Streaming Multi-Order xlsx: {e}")
                     else:
                         print(f"[COOLDOWN] {len(bar_all_opps)} opps detected but held in anti-spam cooldown.")
 
