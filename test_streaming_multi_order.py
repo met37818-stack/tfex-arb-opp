@@ -501,6 +501,7 @@ class TestStreamingMultiOrder(unittest.TestCase):
                 "target": "Strike 920 & S50Z26",
                 "net_pts": 1.80,
                 "max_sets": 5,
+                "rest_verified": True,
                 "order_legs": [
                     {"symbol": "S50Z26C920", "side": "S", "price": 22.50, "depth": 15.0, "is_futures": False},
                     {"symbol": "S50Z26P920", "side": "L", "price": 15.00, "depth": 5.0, "is_futures": False},
@@ -565,6 +566,8 @@ class TestStreamingMultiOrder(unittest.TestCase):
         # 2. Rank #1 checks
         self.assertIn("#1 Conversion (Sell C, Buy P, Buy Fut)", msg)
         self.assertIn("(REST Verified ✅)", msg)
+        # W1: อันดับ #2 ขึ้นไปที่ยังไม่ผ่าน REST ต้องติดป้าย DB-only ไม่ใช่ปล่อยผ่านเงียบ ๆ
+        self.assertIn("DB-only", msg)
         self.assertIn("• L S50Z26P920 @ 15.00 (Vol 5)", msg)
         self.assertIn("• S S50Z26C920 @ 22.50 (Vol 15)", msg)
         self.assertIn("• L S50Z26 @ 920.00 (Vol 50)", msg)
@@ -620,7 +623,9 @@ class TestStreamingMultiOrder(unittest.TestCase):
         self.assertIn("พบ 40 โอกาส", msg)
         # Rank #1 is always intact
         self.assertIn("#1 Call Monotonicity Violation", msg)
-        self.assertIn("(REST Verified ✅)", msg)
+        # 40 opps ไม่ได้ผ่าน REST verification เลย → ต้องติดป้าย DB-only ไม่ใช่ "REST Verified"
+        self.assertIn("DB-only", msg)
+        self.assertNotIn("(REST Verified ✅)", msg)
         # Truncation notice must be present
         self.assertIn("...และอีก", msg)
         self.assertIn("โอกาส (ดูเพิ่มในสรุปปิดรอบ)", msg)
