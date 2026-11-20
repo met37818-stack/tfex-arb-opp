@@ -57,6 +57,11 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SETTRADE_APP_ID: ${{ secrets.SETTRADE_APP_ID }}
+          SETTRADE_APP_SECRET: ${{ secrets.SETTRADE_APP_SECRET }}
+          SETTRADE_BROKER_ID: ${{ secrets.SETTRADE_BROKER_ID }}
+          SETTRADE_APP_CODE: ${{ secrets.SETTRADE_APP_CODE }}
+          SETTRADE_IS_SANDBOX: ${{ secrets.SETTRADE_IS_SANDBOX }}
         run: |
           echo "Scanning TFEX Intraday Arbitrage for Session: ${{ steps.sess.outputs.target_session }}"
           python arb_scanner.py --session ${{ steps.sess.outputs.target_session }}
