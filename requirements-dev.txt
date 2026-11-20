@@ -1,0 +1,5 @@
+# Development / test dependencies.
+# test_session_summary.py imports pytest, so a fresh clone that ran only
+# `pip install -r requirements.txt` could not execute the suite at all.
+-r requirements.txt
+pytest==9.2.0
