@@ -6,6 +6,7 @@ Unit test for enhanced session summary in arb_scanner.py:
 - Verifies Telegram message length (< 3,800 characters)
 """
 
+import datetime
 import math
 import numpy as np
 import pytest
@@ -20,7 +21,8 @@ from arb_scanner import (
     COMMISSION_2LEG_PTS,
     select_dynamic_thor_rate,
     is_executable_market_hours,
-    OpportunityLifespanTracker
+    OpportunityLifespanTracker,
+    BANGKOK_TZ
 )
 
 
@@ -568,6 +570,46 @@ def test_telegram_message_with_lifespan():
     print("✅ Telegram Report Lifespan Rendering & Character Limit (< 3,800) Verified!")
 
 
+def test_lifespan_tracker_aware_vs_naive_finalize():
+    """
+    Verifies that OpportunityLifespanTracker handles comparisons between
+    offset-naive timestamps (e.g. from Turso string logs or strptime) and
+    offset-aware timestamps (e.g. datetime.datetime.now(BANGKOK_TZ)) without
+    throwing TypeError: can't compare offset-naive and offset-aware datetimes.
+    """
+    tracker = OpportunityLifespanTracker()
+
+    # 1. Update with naive string timestamp
+    opp = {"strategy": "Conversion", "target": "Strike 920 & S50Z26", "net_pts": 0.50}
+    tracker.update([opp], "2026-11-20 10:00:00")
+    assert len(tracker.active_opportunities) == 1
+
+    # 2. Update with naive datetime object
+    naive_dt = datetime.datetime(2026, 11, 20, 10, 0, 15)
+    tracker.update([opp], naive_dt)
+
+    # 3. Finalize with offset-aware datetime (BANGKOK_TZ)
+    # Simulate session end 30 seconds after first_seen
+    end_dt_aware = datetime.datetime(2026, 11, 20, 10, 0, 30, tzinfo=BANGKOK_TZ)
+    tracker.finalize(end_dt_aware)
+
+    assert len(tracker.active_opportunities) == 0
+    assert len(tracker.closed_durations) == 1
+    assert math.isclose(tracker.closed_durations[0], 30.0, abs_tol=1e-7)
+
+    # 4. Also test finalize with live datetime.datetime.now(BANGKOK_TZ) directly
+    tracker.update([opp], "2026-11-20 00:00:00")
+    tracker.finalize(datetime.datetime.now(BANGKOK_TZ))
+    assert len(tracker.active_opportunities) == 0
+    assert len(tracker.closed_durations) == 2
+    assert tracker.closed_durations[1] >= 1.0
+
+    stats = tracker.get_stats()
+    assert stats["has_data"] is True
+    assert stats["count"] == 2
+    print("✅ Opportunity Lifespan Tracker Aware vs Naive Finalize Verified!")
+
+
 if __name__ == "__main__":
     test_scan_and_friction_breakdown()
     test_best_of_minute_stats()
@@ -575,4 +617,7 @@ if __name__ == "__main__":
     test_telegram_message_no_profitable_opps()
     test_zero_traded_volume_with_valid_quotes()
     test_dynamic_thor_rate_selection()
+    test_opportunity_lifespan_tracker()
+    test_telegram_message_with_lifespan()
+    test_lifespan_tracker_aware_vs_naive_finalize()
     print("\n🎉 ALL UNIT TESTS PASSED SUCCESSFULLY!")

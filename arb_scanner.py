@@ -1259,10 +1259,26 @@ class OpportunityLifespanTracker:
         self.active_opportunities: Dict[str, Dict[str, datetime.datetime]] = {}
         self.closed_durations: List[float] = []
 
-    def _parse_ts(self, ts_val: Any) -> datetime.datetime:
+    def _normalize_ts(self, ts_val: Any) -> datetime.datetime:
+        """
+        Normalizes any input timestamp (datetime, ISO string, HH:MM:SS) into a
+        consistent timezone-naive Bangkok local datetime object (UTC+7).
+        Guarantees that offset-aware and offset-naive comparisons never fail.
+        """
         if isinstance(ts_val, datetime.datetime):
+            if ts_val.tzinfo is not None:
+                return ts_val.astimezone(BANGKOK_TZ).replace(tzinfo=None)
             return ts_val
+
         s = str(ts_val).strip()
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+            if dt.tzinfo is not None:
+                return dt.astimezone(BANGKOK_TZ).replace(tzinfo=None)
+            return dt
+        except Exception:
+            pass
+
         if len(s) >= 19 and (" " in s or "T" in s):
             s_clean = s[:19].replace("T", " ")
             try:
@@ -1278,8 +1294,11 @@ class OpportunityLifespanTracker:
                 pass
         return datetime.datetime.now(BANGKOK_TZ).replace(tzinfo=None)
 
+    def _parse_ts(self, ts_val: Any) -> datetime.datetime:
+        return self._normalize_ts(ts_val)
+
     def update(self, current_profitable_opps: List[Dict[str, Any]], current_ts: Any) -> None:
-        curr_dt = self._parse_ts(current_ts)
+        curr_dt = self._normalize_ts(current_ts)
         seen_keys = set()
 
         for opp in current_profitable_opps:
@@ -1298,17 +1317,19 @@ class OpportunityLifespanTracker:
         closed_keys = [k for k in self.active_opportunities if k not in seen_keys]
         for k in closed_keys:
             entry = self.active_opportunities.pop(k)
-            first_ts = entry["first_seen_ts"]
-            last_ts = entry["last_seen_ts"]
+            first_ts = self._normalize_ts(entry["first_seen_ts"])
+            last_ts = self._normalize_ts(entry["last_seen_ts"])
+            if last_ts < first_ts:
+                last_ts = first_ts
             dur = max(1.0, (last_ts - first_ts).total_seconds())
             self.closed_durations.append(dur)
 
     def finalize(self, end_ts: Any = None) -> None:
         """Closes all remaining active opportunities at session end."""
-        end_dt = self._parse_ts(end_ts) if end_ts else None
+        end_dt = self._normalize_ts(end_ts) if end_ts is not None else None
         for k, entry in list(self.active_opportunities.items()):
-            first_ts = entry["first_seen_ts"]
-            last_ts = end_dt if end_dt else entry["last_seen_ts"]
+            first_ts = self._normalize_ts(entry["first_seen_ts"])
+            last_ts = end_dt if end_dt is not None else self._normalize_ts(entry["last_seen_ts"])
             if last_ts < first_ts:
                 last_ts = first_ts
             dur = max(1.0, (last_ts - first_ts).total_seconds())
