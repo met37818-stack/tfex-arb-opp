@@ -27,7 +27,16 @@
 - **Executable Sets (`max_sets`):** คำนวณจาก `min(volume)` ของทุกขาที่เกี่ยวข้องในนาทีเดียวกัน (`captured_at_bkk` ตรงกันเป๊ะ)
 - **1-Minute Sync Mechanism:** ในแต่ละนาที จะรอจนถึงวินาทีที่ `:06` หรือ Poll เช็ก `MAX(captured_at_bkk)` ใน `futures_snapshots` และ `options_snapshots` ทุก 3 วินาที เพื่อให้มั่นใจว่าข้อมูลทั้งสองตารางบันทึกเสร็จสมบูรณ์แล้วจึงดึงมาประมวลผลทันที
 - **Smart Anti-Spam Cooldown (15 นาที):** เมื่อพบโอกาสทำกำไรสุทธิ (> 0 จุด) จะแจ้งเตือนทันที (`🚨 [LIVE 1-MIN ARB] โอกาสเคาะทำกำไรทันที!`) และเก็บ Cache ไว้ 15 นาที หากคู่เดิมยังคงอยู่จะไม่สแปมซ้ำ ยกเว้นกรณีที่กำไรสุทธิกระโดดเพิ่มขึ้นอย่างน้อย `+0.20 จุด` หรือเป็น Strike/กลยุทธ์ใหม่ จะยิงแจ้งเตือนทันที
-- **Strict Validation on Session Input:** บังคับตรวจสอบค่า `--session` (MORNING_WORKER, AFTERNOON_WORKER, MIDDAY, EVENING) หากระบุผิดหรือไม่ระบุจะตัดจบการทำงานด้วย Error ทันที (No Silent Fallback)
+- **Strict Validation on Session Input:** `--session` เป็น **required** (ไม่มี default) — ไม่ระบุหรือระบุผิดจะจบด้วย Error ทันที (No Silent Fallback) เดิมค่า default เคยเป็น `MIDDAY` ทำให้ลืม flag แล้วระบบรันผิดโหมดเงียบ ๆ
+
+### 🛡️ Pre-Alert REST Verification Gate (fail-closed)
+
+ก่อนยิง alert ทุกครั้ง ระบบจะ re-quote ทุกขาของอันดับต้น ๆ (สูงสุด `MAX_REST_VERIFIED_OPPS = 3`) ผ่าน Settrade MarketData REST แล้วคำนวณ net profit ใหม่ ถ้าขาไหน depth < 1 หรือ net ≤ 0 จะถูกตัดทิ้ง
+
+- **ถ้า Settrade ใช้งานไม่ได้** (secret หมดอายุ / เน็ตหลุด / ไม่ได้ตั้งค่า) ระบบจะ **ระงับ alert** (fail-closed) ไม่ใช่ปล่อยผ่าน
+- ต้องการแจ้งเตือนด้วยราคาใน DB อยู่ ให้ใส่ `--allow-unverified` — alert จะติดป้าย `⚠️ DB-only (ยังไม่ verified)` ทุกครั้ง
+- อันดับ #2 ขึ้นไปที่ยังไม่ผ่าน REST จะติดป้าย DB-only เช่นกัน ไม่แสดง `REST Verified ✅` ปลอม
+- Quote ที่ไม่ขยับเกิน **120 วินาที** จะถูกตัดออกจาก live scan (`QUOTE_STALENESS_LIVE_SEC`) ส่วน backfill สรุปปิดรอบใช้ 900 วินาที
 
 ---
 
@@ -68,7 +77,7 @@
 ## 🚀 การติดตั้งและใช้งาน (Local Execution)
 
 ```bash
-# ติดตั้ง dependencies
+# ติดตั้ง dependencies (pin แล้ว)
 pip install -r requirements.txt
 
 # รัน Real-time 1-Minute Worker รอบเช้า
@@ -82,4 +91,16 @@ python arb_scanner.py --session MIDDAY
 
 # รันแบบ Single-shot สแกนสรุปทั้งวัน
 python arb_scanner.py --session EVENING
+
+# ยอมรับ alert ที่ไม่ผ่าน REST verification (จะติดป้าย DB-only)
+python arb_scanner.py --session AFTERNOON_WORKER --allow-unverified
 ```
+
+### 🧪 การรันชุดทดสอบ
+
+```bash
+pip install -r requirements-dev.txt   # requirements.txt + pytest (pin แล้ว)
+python -m pytest -q                    # คาดหวัง 39 passed
+```
+
+`--session` เป็น required — ถ้าไม่ใส่จะได้ HTTP 400/argparse error ทันที ไม่ fallback ไป MIDDAY
