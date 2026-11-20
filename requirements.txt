@@ -1,8 +1,12 @@
-requests>=2.31.0
-python-dotenv>=1.0.0
-pytz>=2024.1
-numpy>=1.24.0
-pandas>=2.0.0
-openpyxl>=3.1.2
-settrade_v2
-
+# Pinned for reproducibility — resolved on CPython 3.11 (the version used by
+# .github/workflows/arb_radar.yml). Unpinned bounds previously pulled whatever
+# the runner had at that moment: numpy 2.5.x requires Python >=3.12, so the
+# same file resolved to different versions per interpreter and the detector's
+# pandas rolling semantics could change silently between runs.
+requests==2.34.2
+python-dotenv==1.2.4
+pytz==2026.6
+numpy==2.4.6
+pandas==3.1.1
+openpyxl==3.1.5
+settrade_v2==2.2.1
