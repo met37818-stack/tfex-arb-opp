@@ -10,6 +10,7 @@ Unit tests for Settrade Streaming Multiple Order Excel (.xlsx) generation in arb
 import io
 import unittest
 from unittest.mock import MagicMock
+import datetime
 import openpyxl
 
 from arb_scanner import (
@@ -17,7 +18,11 @@ from arb_scanner import (
     resolve_order_legs,
     format_trade_log_line,
     verify_live_quotes_before_alert,
-    format_live_1min_alert
+    format_live_1min_alert,
+    ArbSmartCooldown,
+    get_penultimate_business_day,
+    get_contract_last_trading_day,
+    BANGKOK_TZ
 )
 
 
@@ -187,7 +192,12 @@ class TestStreamingMultiOrder(unittest.TestCase):
             ]
         }
 
-        file_bytes, filename = generate_streaming_multi_order_xlsx(opp)
+        # Calendar Spread is a statistical spread: must reject by default without allow_statistical=True
+        with self.assertRaises(ValueError):
+            generate_streaming_multi_order_xlsx(opp)
+
+        # When allow_statistical=True, verifies ordering by liquidity depth
+        file_bytes, filename = generate_streaming_multi_order_xlsx(opp, allow_statistical=True)
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
@@ -616,6 +626,79 @@ class TestStreamingMultiOrder(unittest.TestCase):
         self.assertIn("โอกาส (ดูเพิ่มในสรุปปิดรอบ)", msg)
         # Message length strictly below safe ceiling 3,800
         self.assertLess(len(msg), 3800)
+
+    def test_cooldown_decoupled_no_cooldown_on_unverified(self):
+        """
+        Tests decoupling of ArbSmartCooldown:
+        - Checking filter_alertable(auto_record=False) must NOT update cache.
+        - Unverified ghost quotes do not trigger cooldown.
+        - Only calling record_alert() explicitly registers cooldown.
+        """
+        cooldown = ArbSmartCooldown(cooldown_seconds=900, profit_hurdle_pts=0.20)
+        now_dt = datetime.datetime(2026, 11, 20, 10, 0, 0, tzinfo=BANGKOK_TZ)
+
+        opp = {
+            "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
+            "target": "Strike 920 & S50Z26",
+            "net_pts": 1.50
+        }
+
+        # 1. First inspection: alertable
+        eligible_1 = cooldown.filter_alertable([opp], now_dt, auto_record=False)
+        self.assertEqual(len(eligible_1), 1)
+        # Cache must remain empty
+        self.assertEqual(len(cooldown.cache), 0)
+
+        # 2. Suppose REST double-check fails (ghost quote). Next tick 5 seconds later:
+        next_dt = now_dt + datetime.timedelta(seconds=5)
+        eligible_2 = cooldown.filter_alertable([opp], next_dt, auto_record=False)
+        # Must still be eligible because cooldown was not recorded!
+        self.assertEqual(len(eligible_2), 1)
+
+        # 3. Suppose REST succeeds and record_alert is called:
+        cooldown.record_alert(opp, next_dt)
+        self.assertEqual(len(cooldown.cache), 1)
+
+        # 4. Subsequent inspection 10 seconds later without profit improvement: suppressed by cooldown!
+        later_dt = next_dt + datetime.timedelta(seconds=10)
+        eligible_3 = cooldown.filter_alertable([opp], later_dt, auto_record=False)
+        self.assertEqual(len(eligible_3), 0)
+
+    def test_breakeven_fut_hedge_price_in_alert(self):
+        """
+        Tests that Conversion / Reversal alert message includes Breakeven Fut Hedge price line.
+        """
+        opp = {
+            "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
+            "target": "Strike 920 & S50Z26",
+            "net_pts": 1.50,
+            "max_sets": 5,
+            "strike": 920.0,
+            "order_legs": [
+                {"symbol": "S50Z26C920", "side": "S", "price": 22.50, "depth": 15.0, "is_futures": False},
+                {"symbol": "S50Z26P920", "side": "L", "price": 15.00, "depth": 5.0, "is_futures": False},
+                {"symbol": "S50Z26", "side": "L", "price": 920.00, "depth": 50.0, "is_futures": True}
+            ]
+        }
+        msg = format_live_1min_alert(
+            trade_date="2026-11-20",
+            bar_ts="10:15:00",
+            profitable_opps=[opp],
+            thor_rate=0.0225,
+            dte=35,
+            T_years=35 / 365.0
+        )
+        self.assertIn("Breakeven Fut Hedge:", msg)
+        self.assertIn("Long Fut &lt;=", msg)
+
+    def test_penultimate_business_day_holidays(self):
+        """
+        Tests that get_penultimate_business_day accounts for SET_HOLIDAYS in Dec 2026.
+        """
+        p_day = get_penultimate_business_day(2026, 12)
+        self.assertEqual(p_day.strftime("%Y-%m-%d"), "2026-12-29")
+        ltd = get_contract_last_trading_day(2026, 12)
+        self.assertEqual(ltd.strftime("%Y-%m-%d %H:%M:%S"), "2026-12-29 16:30:00")
 
 
 if __name__ == "__main__":

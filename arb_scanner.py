@@ -57,11 +57,34 @@ load_dotenv()
 
 BANGKOK_TZ = pytz.timezone("Asia/Bangkok")
 CONTRACT_MULTIPLIER = 200.0  # THB per SET50 index point
-COMMISSION_2LEG_PTS = 0.40   # 2 legs * 0.20 index pts
-COMMISSION_3LEG_PTS = 0.60   # 3 legs * 0.20 index pts
+
+# Fee & Commission Settings (Lock 20.0 THB/side = 40.0 THB round-turn per leg = 0.20 index pts/leg)
+FEE_PER_SIDE_THB = float(os.getenv("FEE_PER_SIDE_THB", "20.0"))
+COMMISSION_PER_LEG_PTS = (2.0 * FEE_PER_SIDE_THB) / CONTRACT_MULTIPLIER  # 0.20 index pts
+COMMISSION_2LEG_PTS = 2.0 * COMMISSION_PER_LEG_PTS   # 0.40 index pts (80 THB)
+COMMISSION_3LEG_PTS = 3.0 * COMMISSION_PER_LEG_PTS   # 0.60 index pts (120 THB)
+COMMISSION_4LEG_PTS = 4.0 * COMMISSION_PER_LEG_PTS   # 0.80 index pts (160 THB)
 
 MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
 REVERSE_MONTH_CODES = {"H": 3, "M": 6, "U": 9, "Z": 12}
+
+# Official SET Holidays (2026 - 2028)
+SET_HOLIDAYS = {
+    # 2026
+    "2026-01-01", "2026-01-02", "2026-03-03", "2026-04-06", "2026-04-13",
+    "2026-04-14", "2026-04-15", "2026-05-01", "2026-05-04", "2026-06-01",
+    "2026-06-03", "2026-07-28", "2026-07-29", "2026-08-12", "2026-10-13",
+    "2026-10-16", "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
+    # 2027
+    "2027-01-01", "2027-02-22", "2027-04-06", "2027-04-13", "2027-04-14",
+    "2027-04-15", "2027-05-03", "2027-05-04", "2027-05-20", "2027-06-03",
+    "2027-07-19", "2027-07-28", "2027-08-12", "2027-10-13", "2027-10-25",
+    "2027-12-06", "2027-12-10", "2027-12-31",
+    # 2028
+    "2028-01-03", "2028-02-10", "2028-04-06", "2028-04-13", "2028-04-14",
+    "2028-05-01", "2028-05-05", "2028-06-05", "2028-07-17", "2028-07-28",
+    "2028-08-14", "2028-10-13", "2028-10-23", "2028-12-05", "2028-12-11"
+}
 
 
 # ==============================================================================
@@ -199,17 +222,24 @@ def record_arb_heartbeat(
 # 3. DYNAMIC SERIES & EXPIRATION CALCULATION
 # ==============================================================================
 
-def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
+def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> date:
+    """
+    Calculate the penultimate business day of a given month.
+    (TFEX contract specification for SET50 Futures & Options expiration).
+    """
     _, last_day = calendar.monthrange(year, month)
     biz_days = [
         date(year, month, d)
         for d in range(1, last_day + 1)
-        if date(year, month, d).weekday() < 5
+        if date(year, month, d).weekday() < 5 and date(year, month, d).strftime("%Y-%m-%d") not in holidays
     ]
-    if len(biz_days) >= 2:
-        ltd = biz_days[-2]
-    else:
-        ltd = biz_days[-1]
+    if len(biz_days) < 2:
+        return biz_days[-1] if biz_days else date(year, month, last_day)
+    return biz_days[-2]
+
+
+def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
+    ltd = get_penultimate_business_day(year, month, SET_HOLIDAYS)
     return BANGKOK_TZ.localize(datetime.datetime(ltd.year, ltd.month, ltd.day, 16, 30, 0))
 
 
@@ -831,7 +861,7 @@ def scan_calendar_spreads(
     calc_error_count = 0
     minute_bests: Dict[str, float] = {}
 
-    spread_records = []
+    minute_spreads: Dict[str, Dict[str, Any]] = {}
     for ts in sorted(grouped_data.keys()):
         frame = grouped_data[ts]
         f1 = frame["futures"].get(f1_sym)
@@ -855,14 +885,18 @@ def scan_calendar_spreads(
         mid2 = (b2 + a2) / 2.0
         mid_spread = mid1 - mid2
 
-        spread_records.append({
+        # 1-minute bar bucket key to resample irregular CDC ticks into continuous bars
+        m_key = ts[:16] + ":00" if len(ts) >= 16 else (ts[:5] + ":00" if len(ts) >= 5 else ts)
+        minute_spreads[m_key] = {
             "ts": ts,
             "b1": b1, "a1": a1, "b1_vol": b1_vol, "a1_vol": a1_vol,
             "b2": b2, "a2": a2, "b2_vol": b2_vol, "a2_vol": a2_vol,
             "mid_spread": mid_spread
-        })
+        }
 
-    if len(spread_records) < 10:
+    spread_records = [minute_spreads[k] for k in sorted(minute_spreads.keys())]
+
+    if len(spread_records) < 5:
         return [], None, dropped_invalid_quotes, calc_error_count, {}
 
     df_sp = pd.DataFrame(spread_records)
@@ -904,7 +938,7 @@ def scan_calendar_spreads(
         item_up = {
             "strategy": "Calendar Spread Spike (Overextended High)",
             "target": f"{f1_sym} - {f2_sym}",
-            "tag": "[Calendar Spread]",
+            "tag": "[Statistical Spread]",
             "time": ts,
             "series": f"{front_series}-{next_series}",
             "gross_pts": dev_up,
@@ -950,7 +984,7 @@ def scan_calendar_spreads(
         item_down = {
             "strategy": "Calendar Spread Spike (Overextended Low)",
             "target": f"{f1_sym} - {f2_sym}",
-            "tag": "[Calendar Spread]",
+            "tag": "[Statistical Spread]",
             "time": ts,
             "series": f"{front_series}-{next_series}",
             "gross_pts": dev_down,
@@ -1123,7 +1157,7 @@ def resolve_order_legs(opp: Dict[str, Any]) -> List[Dict[str, Any]]:
     return resolved
 
 
-def generate_streaming_multi_order_xlsx(opp: Dict[str, Any]) -> Tuple[bytes, str]:
+def generate_streaming_multi_order_xlsx(opp: Dict[str, Any], allow_statistical: bool = False) -> Tuple[bytes, str]:
     """
     Generates a Settrade Streaming Multiple Order import Excel (.xlsx) file in-memory.
     Columns: Symbol, Side, Volume, Price, Position, Type, Validity, Iceberg
@@ -1136,6 +1170,7 @@ def generate_streaming_multi_order_xlsx(opp: Dict[str, Any]) -> Tuple[bytes, str
     - Iceberg: None (empty)
     - Side: "L" for Buy (Ask), "S" for Sell (Bid)
     - Price: Execution price (Ask for Buy, Bid for Sell)
+    - Restricted to Pure Arbitrage (Disallows Statistical Spreads like Calendar Spread by default).
 
     Critical Execution Order (Reduce Legging Risk):
     - Options sorted ascending by liquidity depth (least liquid first)
@@ -1144,6 +1179,13 @@ def generate_streaming_multi_order_xlsx(opp: Dict[str, Any]) -> Tuple[bytes, str
     Returns:
     - (file_bytes, filename)
     """
+    strat = opp.get("strategy", "Arb")
+    if "Calendar" in strat and not allow_statistical:
+        raise ValueError(
+            f"Calendar Spread ('{strat}') is a statistical spread, not pure arbitrage. "
+            f"Streaming Multi-Order Excel generation is restricted to pure arbitrage only."
+        )
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "MultipleOrder"
@@ -1690,39 +1732,68 @@ class ArbSmartCooldown:
         self.profit_hurdle_pts = profit_hurdle_pts
         self.cache: Dict[str, Dict[str, Any]] = {}
 
-    def filter_alertable(self, opps: List[Dict[str, Any]], now_dt: datetime.datetime) -> List[Dict[str, Any]]:
+    def is_alertable(self, opp: Dict[str, Any], now_dt: datetime.datetime) -> Tuple[bool, Optional[str]]:
+        """
+        Pure inspection: checks whether an opportunity is eligible for alerting.
+        Does NOT modify cache or record cooldown state.
+        Returns: (is_eligible, reason_or_spike_stat)
+        """
+        key = f"{opp['strategy']}|{opp['target']}"
+        net_pts = float(opp.get("net_pts", 0.0))
+
+        if key not in self.cache:
+            return True, None
+
+        entry = self.cache[key]
+        elapsed = (now_dt - entry["last_alerted_at"]).total_seconds()
+        profit_diff = net_pts - entry["last_net_pts"]
+
+        if elapsed >= self.cooldown_seconds:
+            return True, None
+        elif profit_diff >= self.profit_hurdle_pts:
+            return True, f"Profit Spike: +{profit_diff:.2f} pts vs previous alert"
+        else:
+            return False, None
+
+    def filter_alertable(
+        self,
+        opps: List[Dict[str, Any]],
+        now_dt: datetime.datetime,
+        auto_record: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Filters list of opportunities to those eligible for alerting.
+        If auto_record is False (default for decoupled REST verification),
+        cache is NOT updated until record_alert() is called after verification succeeds.
+        """
         alertable = []
         for opp in opps:
-            key = f"{opp['strategy']}|{opp['target']}"
-            net_pts = opp["net_pts"]
-
-            if key not in self.cache:
-                alertable.append(opp)
-                self.cache[key] = {
-                    "last_alerted_at": now_dt,
-                    "last_net_pts": net_pts,
-                    "alert_count": 1
-                }
-            else:
-                entry = self.cache[key]
-                elapsed = (now_dt - entry["last_alerted_at"]).total_seconds()
-                profit_diff = net_pts - entry["last_net_pts"]
-
-                if elapsed >= self.cooldown_seconds:
-                    alertable.append(opp)
-                    self.cache[key]["last_alerted_at"] = now_dt
-                    self.cache[key]["last_net_pts"] = net_pts
-                    self.cache[key]["alert_count"] = entry.get("alert_count", 0) + 1
-                elif profit_diff >= self.profit_hurdle_pts:
-                    opp["stats"] = f"Profit Spike: +{profit_diff:.2f} pts vs previous alert"
-                    alertable.append(opp)
-                    self.cache[key]["last_alerted_at"] = now_dt
-                    self.cache[key]["last_net_pts"] = net_pts
-                    self.cache[key]["alert_count"] = entry.get("alert_count", 0) + 1
-                else:
-                    # Cooldown active; suppress alert
-                    pass
+            eligible, spike_stat = self.is_alertable(opp, now_dt)
+            if eligible:
+                opp_copy = dict(opp)
+                if spike_stat:
+                    opp_copy["stats"] = spike_stat
+                alertable.append(opp_copy)
+                if auto_record:
+                    self.record_alert(opp, now_dt)
         return alertable
+
+    def record_alert(self, opp: Dict[str, Any], now_dt: datetime.datetime):
+        """
+        Explicitly records that an opportunity was verified by REST and alerted via Telegram.
+        """
+        key = f"{opp['strategy']}|{opp['target']}"
+        net_pts = float(opp.get("net_pts", 0.0))
+        if key not in self.cache:
+            self.cache[key] = {
+                "last_alerted_at": now_dt,
+                "last_net_pts": net_pts,
+                "alert_count": 1
+            }
+        else:
+            self.cache[key]["last_alerted_at"] = now_dt
+            self.cache[key]["last_net_pts"] = net_pts
+            self.cache[key]["alert_count"] = self.cache[key].get("alert_count", 0) + 1
 
 
 class OpportunityLifespanTracker:
@@ -1908,9 +1979,35 @@ def format_live_1min_alert(
         legs_lines = _format_legs_rank1(opp)
         log_line = format_trade_log_line(opp)
 
+        be_hedge_line = ""
+        if "Conversion" in strat or "Reversal" in strat:
+            k = float(opp.get("strike", 0.0))
+            if k <= 0:
+                m_k = re.search(r"Strike\s*(\d+)", target, re.IGNORECASE)
+                if m_k:
+                    k = float(m_k.group(1))
+            order_legs = opp.get("order_legs") or resolve_order_legs(opp)
+            fut_leg = next((l for l in order_legs if _is_fut(l)), None)
+            c_leg = next((l for l in order_legs if not _is_fut(l) and "C" in str(l.get("symbol"))), None)
+            p_leg = next((l for l in order_legs if not _is_fut(l) and "P" in str(l.get("symbol"))), None)
+
+            if k > 0 and c_leg and p_leg and fut_leg:
+                c_px = float(c_leg["price"])
+                p_px = float(p_leg["price"])
+                comm = float(opp.get("commission_pts", COMMISSION_3LEG_PTS))
+                disc = float(opp.get("disc_factor") or math.exp(-thor_rate * max(T_years, 1e-6)))
+                fut_side = str(fut_leg.get("side", "")).upper()
+                if fut_side in ("L", "BUY", "LONG"):
+                    f_be = k + (c_px - p_px - comm) / disc
+                    be_hedge_line = f"\n  🎯 <b>Breakeven Fut Hedge:</b> <code>Long Fut &lt;= {f_be:.2f}</code> (ป้องกัน Legging Risk)"
+                else:
+                    f_be = k + (c_px - p_px + comm) / disc
+                    be_hedge_line = f"\n  🎯 <b>Breakeven Fut Hedge:</b> <code>Short Fut &gt;= {f_be:.2f}</code> (ป้องกัน Legging Risk)"
+
         return (
             f"<b>#1 {strat}</b> <code>{target}</code> | Net: 🟢 <b>+{net_pts:.2f} จุด (+{net_thb:,.0f} บ.)</b> | Max: <b>{max_sets}</b> ชุด (REST Verified ✅)\n"
-            + "\n".join(legs_lines) + "\n"
+            + "\n".join(legs_lines)
+            + be_hedge_line + "\n"
             + f"<code>{log_line}</code>"
         )
 
@@ -2278,10 +2375,24 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
     expiry_dt = parse_series_expiry(front_series, trade_date_obj)
     dte = (expiry_dt.date() - trade_date_obj).days
-    if dte <= 0:
-        print(f"[ERROR] Invalid DTE ({dte} days) for series {front_series}. Exiting.")
+    if dte < 0:
+        print(f"[ERROR] Invalid DTE ({dte} days) for expired series {front_series}. Exiting.")
         sys.exit(1)
-    T_years = dte / 365.0
+    elif dte == 0:
+        # Expiry Day (0 DTE): Trading halts at 16:30:00 ICT for expiring series.
+        close_today = BANGKOK_TZ.localize(datetime.datetime(trade_date_obj.year, trade_date_obj.month, trade_date_obj.day, 16, 30, 0))
+        rem_seconds = (close_today - now_bkk).total_seconds()
+        if rem_seconds <= 0:
+            print(f"[INFO] Front series {front_series} trading ceased at 16:30:00 on expiry day {expiry_dt.date()}.")
+            sys.exit(0)
+        rem_hours = rem_seconds / 3600.0
+        T_years = max(rem_hours, 0.1) / (365.0 * 24.0)
+        if session_mode == "AFTERNOON_WORKER":
+            session_end_time = time(16, 30, 5)
+            summary_end_str = "16:30:05"
+            summary_title = "สรุปภาพรวมวันหมดอายุ (09:45–16:30 น.)"
+    else:
+        T_years = dte / 365.0
     thor_record = fetch_thor_rates_record(pipeline_url, turso_token)
     thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
@@ -2342,8 +2453,13 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     # --------------------------------------------------------------------------
     bound_start = f"{trade_date} {summary_start_str}"
     bound_end = f"{trade_date} {summary_end_str}"
-    sql_check = "SELECT MAX(captured_at_bkk) FROM futures_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?;"
-    sql_opt_check = "SELECT COUNT(*) FROM options_snapshots WHERE captured_at_bkk = ?;"
+    sql_check = """
+    SELECT MAX(ts) FROM (
+        SELECT MAX(captured_at_bkk) AS ts FROM futures_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?
+        UNION ALL
+        SELECT MAX(captured_at_bkk) AS ts FROM options_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?
+    );
+    """
 
     while True:
         curr_bkk = datetime.datetime.now(BANGKOK_TZ)
@@ -2356,26 +2472,17 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
             record_arb_heartbeat(pipeline_url, turso_token, session_mode, curr_bkk)
             last_heartbeat_time = pytime.time()
 
-        # Check for newly written event in Turso
+        # Check for newly written event in Turso (Futures or Options)
         new_ts_found = None
         try:
-            _, check_rows = execute_turso_sql(pipeline_url, turso_token, sql_check, [bound_start, bound_end])
+            _, check_rows = execute_turso_sql(pipeline_url, turso_token, sql_check, [bound_start, bound_end, bound_start, bound_end])
             turso_max_ts = str(check_rows[0][0]) if check_rows and check_rows[0][0] else None
         except Exception as e:
             print(f"[POLL] Error checking Turso max timestamp: {e}")
             turso_max_ts = None
 
         if turso_max_ts and (last_scanned_ts is None or turso_max_ts > last_scanned_ts):
-            # Verify options_snapshots also has data for turso_max_ts
-            try:
-                _, opt_check_rows = execute_turso_sql(pipeline_url, turso_token, sql_opt_check, [turso_max_ts])
-                opt_bar_cnt = int(opt_check_rows[0][0]) if opt_check_rows and opt_check_rows[0][0] else 0
-            except Exception as e:
-                print(f"[POLL] Error checking options count for {turso_max_ts}: {e}")
-                opt_bar_cnt = 0
-
-            if opt_bar_cnt > 0:
-                new_ts_found = turso_max_ts
+            new_ts_found = turso_max_ts
 
         if new_ts_found:
             delta_start = last_scanned_ts if last_scanned_ts else bound_start
@@ -2506,7 +2613,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                 if not is_executable_market_hours(curr_bkk):
                     print(f"[MARKET-HOURS] Outside executable trading hours ({curr_bkk.strftime('%H:%M:%S')}). Suppressing LIVE Telegram alert ({len(bar_all_opps)} opps held).")
                 else:
-                    alertable = cooldown.filter_alertable(bar_all_opps, curr_bkk)
+                    alertable = cooldown.filter_alertable(bar_all_opps, curr_bkk, auto_record=False)
                     if alertable:
                         ranked_alertable = sorted(alertable, key=lambda x: x.get("net_pts", 0.0), reverse=True)
                         top_1_opp = ranked_alertable[0]
@@ -2537,17 +2644,22 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                             )
                             if not no_telegram and tg_token and tg_chat_id:
                                 send_telegram_alert(tg_token, tg_chat_id, live_msg)
-                                # Generate & attach Settrade Streaming Multiple Order Excel file for Top 1 opportunity
-                                try:
-                                    xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(updated_top_1)
-                                    doc_caption = (
-                                        f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{updated_top_1['strategy']}</code> | "
-                                        f"<code>{updated_top_1['target']}</code> (Net: <b>+{updated_top_1['net_pts']:.2f} pts</b>)\n"
-                                        f"⚡ <i>นำเข้าเมนู Multiple Order บน Settrade Streaming เพื่อส่งคำสั่งพร้อมกัน</i>"
-                                    )
-                                    send_telegram_document(tg_token, tg_chat_id, xlsx_bytes, xlsx_filename, caption=doc_caption)
-                                except Exception as e:
-                                    print(f"[EXCEL] Error generating/sending Streaming Multi-Order xlsx: {e}")
+                                # Record alert cooldown only after REST verification succeeds and alert is dispatched
+                                for opp_alerted in ranked_alertable:
+                                    cooldown.record_alert(opp_alerted, curr_bkk)
+
+                                # Generate & attach Settrade Streaming Multiple Order Excel file for Top 1 pure arbitrage opportunity
+                                if "Calendar" not in updated_top_1.get("strategy", ""):
+                                    try:
+                                        xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(updated_top_1)
+                                        doc_caption = (
+                                            f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{updated_top_1['strategy']}</code> | "
+                                            f"<code>{updated_top_1['target']}</code> (Net: <b>+{updated_top_1['net_pts']:.2f} pts</b>)\n"
+                                            f"⚡ <i>นำเข้าเมนู Multiple Order บน Settrade Streaming เพื่อส่งคำสั่งพร้อมกัน</i>"
+                                        )
+                                        send_telegram_document(tg_token, tg_chat_id, xlsx_bytes, xlsx_filename, caption=doc_caption)
+                                    except Exception as e:
+                                        print(f"[EXCEL] Error generating/sending Streaming Multi-Order xlsx: {e}")
                     else:
                         print(f"[COOLDOWN] {len(bar_all_opps)} opps detected but held in anti-spam cooldown.")
 
@@ -2671,10 +2783,19 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
     cand_fut, front_series, next_series = resolve_active_series_candidates(now_bkk)
     expiry_dt = parse_series_expiry(front_series, trade_date_obj)
     dte = (expiry_dt.date() - trade_date_obj).days
-    if dte <= 0:
-        print(f"[ERROR] Invalid DTE ({dte} days) for series {front_series}. Exiting.")
+    if dte < 0:
+        print(f"[ERROR] Invalid DTE ({dte} days) for expired series {front_series}. Exiting.")
         sys.exit(1)
-    T_years = dte / 365.0
+    elif dte == 0:
+        close_today = BANGKOK_TZ.localize(datetime.datetime(trade_date_obj.year, trade_date_obj.month, trade_date_obj.day, 16, 30, 0))
+        rem_seconds = (close_today - now_bkk).total_seconds()
+        rem_hours = max(rem_seconds, 360.0) / 3600.0
+        T_years = max(rem_hours, 0.1) / (365.0 * 24.0)
+        if sess_upper == "EVENING":
+            t_end_bkk = "16:30:05"
+            sess_title = "ปิดตลาดวันหมดอายุ (09:45–16:30 น.)"
+    else:
+        T_years = dte / 365.0
     thor_record = fetch_thor_rates_record(pipeline_url, turso_token)
     thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
