@@ -65,6 +65,25 @@ COMMISSION_2LEG_PTS = 2.0 * COMMISSION_PER_LEG_PTS   # 0.40 index pts (80 THB)
 COMMISSION_3LEG_PTS = 3.0 * COMMISSION_PER_LEG_PTS   # 0.60 index pts (120 THB)
 COMMISSION_4LEG_PTS = 4.0 * COMMISSION_PER_LEG_PTS   # 0.80 index pts (160 THB)
 
+# THOR (BOT) publishes rates as PERCENT per annum (e.g. 0.994 == 0.994%).
+# Never infer the unit from magnitude: 0.45% would be read as 45% and the
+# discount factor exp(-r*T) collapses, fabricating parity edges of several
+# index points on deep strikes.
+THOR_MAX_PCT = 25.0
+
+# How many of the top-ranked opportunities get re-quoted against Settrade REST
+# before a live alert. Rank 1 alone used to be verified while ranks 2+ were
+# shipped with DB prices up to 15 minutes old and no label.
+MAX_REST_VERIFIED_OPPS = 3
+
+# Quote staleness bound.
+# LIVE alerting: 900s (15 นาที) ยาวเกินรอบรีเฟรช quote ของ TFEX options มาก —
+# quote ที่หยุดขยับไป 14 นาทียังถูกใช้คำนวณและยิง alert ได้ เป็นต้นตอหลักของ
+# opportunity ผี. 120s บังคับให้ quote ที่ใช้ยิง alert ต้องสดจริง
+# BACKFILL (สรุปปิดรอบ): คง 900s เพื่อให้ strike ที่เทรดบางยังถูก forward-fill
+QUOTE_STALENESS_LIVE_SEC = 120
+QUOTE_STALENESS_BACKFILL_SEC = 900
+
 MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
 REVERSE_MONTH_CODES = {"H": 3, "M": 6, "U": 9, "Z": 12}
 
@@ -127,9 +146,17 @@ def execute_turso_sql(
     pipeline_url: str,
     auth_token: str,
     sql: str,
-    args: Optional[List[Any]] = None
+    args: Optional[List[Any]] = None,
+    max_attempts: int = 3
 ) -> Tuple[List[str], List[List[Any]]]:
-    """Executes SQL via Turso v2 pipeline."""
+    """
+    Executes SQL via Turso v2 pipeline.
+
+    Transient failures (network errors, HTTP 429/5xx) retry with exponential
+    backoff, honouring Retry-After up to 30s — a 5xx from Turso used to kill the
+    whole scan tick / the worker at startup. SQL errors (syntax, constraint)
+    are NOT retried: they are deterministic and would just burn the timeout.
+    """
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
@@ -143,19 +170,44 @@ def execute_turso_sql(
             {"type": "close"}
         ]
     }
-    r = requests.post(pipeline_url, json=payload, headers=headers, timeout=25)
-    if r.status_code != 200:
-        raise RuntimeError(f"Turso API HTTP error ({r.status_code}): {r.text}")
-    data = r.json()
-    for resp_item in data.get("results", []):
-        if resp_item.get("type") == "error":
-            raise RuntimeError(f"Turso SQL execution error: {resp_item.get('error')}")
-        if resp_item.get("type") == "ok":
-            res = resp_item["response"]["result"]
-            cols = [c["name"] for c in res.get("cols", [])]
-            rows = parse_turso_result_rows(res)
-            return cols, rows
-    return [], []
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(pipeline_url, json=payload, headers=headers, timeout=25)
+        except requests.RequestException as exc:
+            last_exc = exc
+            delay = min(2.0 ** (attempt - 1), 8.0)
+        else:
+            if r.status_code == 429 or r.status_code >= 500:
+                last_exc = RuntimeError(f"Turso API HTTP error ({r.status_code}): {r.text[:200]}")
+                retry_after = (r.headers.get("Retry-After") or "").strip()
+                delay = min(float(retry_after), 30.0) if retry_after.replace(".", "", 1).isdigit() \
+                    else min(2.0 ** (attempt - 1), 8.0)
+            elif r.status_code != 200:
+                raise RuntimeError(f"Turso API HTTP error ({r.status_code}): {r.text[:200]}")
+            else:
+                data = r.json()
+                for resp_item in data.get("results", []):
+                    if resp_item.get("type") == "error":
+                        # deterministic — retrying cannot help
+                        raise RuntimeError(f"Turso SQL execution error: {resp_item.get('error')}")
+                    if resp_item.get("type") == "ok":
+                        res = resp_item["response"]["result"]
+                        cols = [c["name"] for c in res.get("cols", [])]
+                        rows = parse_turso_result_rows(res)
+                        return cols, rows
+                return [], []
+
+        if attempt >= max_attempts:
+            break
+        print(f"[TURSO] {type(last_exc).__name__} on attempt {attempt}/{max_attempts}: "
+              f"{str(last_exc)[:120]} — retry in {delay:.0f}s")
+        pytime.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Turso request failed without a captured error")
 
 
 # ==============================================================================
@@ -209,8 +261,11 @@ def record_arb_heartbeat(
     try:
         ensure_arb_heartbeat_table(pipeline_url, auth_token)
         sql = """
-        INSERT OR REPLACE INTO arb_worker_heartbeat (worker_session, last_heartbeat_bkk, pid)
-        VALUES (?, ?, ?);
+        INSERT INTO arb_worker_heartbeat (worker_session, last_heartbeat_bkk, pid)
+        VALUES (?, ?, ?)
+        ON CONFLICT(worker_session) DO UPDATE SET
+            last_heartbeat_bkk = excluded.last_heartbeat_bkk,
+            pid = excluded.pid;
         """
         now_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
         execute_turso_sql(pipeline_url, auth_token, sql, [session_name, now_str, os.getpid()])
@@ -227,6 +282,10 @@ def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLI
     Calculate the penultimate business day of a given month.
     (TFEX contract specification for SET50 Futures & Options expiration).
     """
+    if not any(str(h).startswith(str(year)) for h in holidays):
+        print(f"[CALENDAR] WARNING: SET_HOLIDAYS has no data for {year} — expiry date for "
+              f"{year}-{month:02d} may be wrong. Update SET_HOLIDAYS before trading that year.")
+
     _, last_day = calendar.monthrange(year, month)
     biz_days = [
         date(year, month, d)
@@ -274,6 +333,29 @@ def parse_series_expiry(series_code: str, ref_date: date) -> datetime.datetime:
 # 4. TURSO INTRADAY DATASET LOADER (STRICT VALIDATION)
 # ==============================================================================
 
+def _to_decimal_rate(val: Optional[float], label: str = "") -> Optional[float]:
+    """
+    Converts a BOT THOR reading into a decimal annual rate.
+
+    THOR is ALWAYS published as percent per annum, so divide by 100
+    unconditionally. The previous heuristic (`val / 100 if val > 0.5 else val`)
+    silently turned 0.45% into 45%: exp(-r*T) then collapsed from 0.9996 to
+    0.9637 at 30 DTE, which fabricates ~1.8 index points of parity edge
+    (0.60 points of commission, so the alert fires) out of thin air.
+    """
+    if val is None:
+        return None
+    pct = float(val)
+    if pct <= 0:
+        return None
+    if pct > THOR_MAX_PCT:
+        raise ValueError(
+            f"THOR rate out of range: {pct} ({label}) — expected percent p.a., "
+            f"max {THOR_MAX_PCT}%"
+        )
+    return pct / 100.0
+
+
 def select_dynamic_thor_rate(
     thor_record: Dict[str, Optional[float]],
     dte: int
@@ -298,15 +380,10 @@ def select_dynamic_thor_rate(
     Returns:
         (rate_decimal, tenor_label) where rate_decimal is in decimal form (e.g. 0.00995)
     """
-    def _clean(val: Optional[float]) -> Optional[float]:
-        if val is None or val <= 0:
-            return None
-        return val / 100.0 if val > 0.5 else val
-
-    r_on = _clean(thor_record.get("overnight"))
-    r_1m = _clean(thor_record.get("1m"))
-    r_3m = _clean(thor_record.get("3m"))
-    r_6m = _clean(thor_record.get("6m"))
+    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
+    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
+    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
+    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
 
     if dte <= 30:
         candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
@@ -489,7 +566,7 @@ def fetch_intraday_arb_dataset(
                 if u_ts:
                     try:
                         u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
-                        if (m_dt - u_dt).total_seconds() > 900:
+                        if (m_dt - u_dt).total_seconds() > QUOTE_STALENESS_BACKFILL_SEC:
                             del running_futures[sym]
                     except Exception:
                         pass
@@ -499,7 +576,7 @@ def fetch_intraday_arb_dataset(
                 if u_ts:
                     try:
                         u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
-                        if (m_dt - u_dt).total_seconds() > 900:
+                        if (m_dt - u_dt).total_seconds() > QUOTE_STALENESS_BACKFILL_SEC:
                             del running_options[key]
                     except Exception:
                         pass
@@ -519,6 +596,25 @@ def fetch_intraday_arb_dataset(
 # ==============================================================================
 # 5. THREE INTRADAY ARBITRAGE SCAN MODULES (STRICT BLACK-76 VALIDATION)
 # ==============================================================================
+
+def _exec_sets(*depths: Any) -> int:
+    """
+    จำนวนชุดที่เคาะได้จริง = min(depth ของทุกขา) ปัดลง
+
+    S1: เดิมใช้ int(min(...)) ตรง ๆ ทำให้ depth ที่ไม่ใช่จำนวนเต็มกลายเป็น 0 ชุด
+    แต่ opp ยังถูกส่งออกไปพร้อมข้อความ 'Max: 0 ชุด' ซึ่งเป็น alert ที่สั่งให้
+    เคาะออเดอร์ที่เคาะไม่ได้ ผู้เรียกต้องข้าม opp ที่ได้ 0
+    """
+    vals = []
+    for d in depths:
+        try:
+            vals.append(float(d))
+        except (TypeError, ValueError):
+            return 0
+    if not vals or any(v <= 0 for v in vals):
+        return 0
+    return int(min(vals))
+
 
 def scan_put_call_parity(
     grouped_data: Dict[str, Dict[str, Any]],
@@ -593,7 +689,9 @@ def scan_put_call_parity(
             # 1. Conversion: (Call_Bid - Put_Ask) - (Fut_Ask - K) * exp(-r * T)
             # Requires strict depth: Sell Call @ Bid, Buy Put @ Ask, Buy Fut @ Ask
             if c_bvol > 0 and p_avol > 0 and f_avol > 0:
-                max_sets_conv = int(min(c_bvol, p_avol, f_avol))
+                max_sets_conv = _exec_sets(c_bvol, p_avol, f_avol)
+                if max_sets_conv < 1:
+                    continue
                 try:
                     disc_diff_mid = (f_mid - k) * disc_factor
                     mid_edge_conv = (c_mid - p_mid) - disc_diff_mid
@@ -648,7 +746,9 @@ def scan_put_call_parity(
             # 2. Reversal: (Fut_Bid - K) * exp(-r * T) - (Call_Ask - Put_Bid)
             # Requires strict depth: Buy Call @ Ask, Sell Put @ Bid, Sell Fut @ Bid
             if c_avol > 0 and p_bvol > 0 and f_bvol > 0:
-                max_sets_rev = int(min(c_avol, p_bvol, f_bvol))
+                max_sets_rev = _exec_sets(c_avol, p_bvol, f_bvol)
+                if max_sets_rev < 1:
+                    continue
                 try:
                     disc_diff_mid = (f_mid - k) * disc_factor
                     mid_edge_rev = disc_diff_mid - (c_mid - p_mid)
@@ -747,7 +847,9 @@ def scan_vertical_spreads(
                 v_c2_bid = c2.get("bid_vol", 0.0) or 0.0
                 if v_c1_ask <= 0 or v_c2_bid <= 0:
                     continue
-                max_sets = int(min(v_c1_ask, v_c2_bid))
+                max_sets = _exec_sets(v_c1_ask, v_c2_bid)
+                if max_sets < 1:
+                    continue
 
                 c1_sym = c1.get("symbol") or f"S50{front_series}C{k1:.0f}"
                 c2_sym = c2.get("symbol") or f"S50{front_series}C{k2:.0f}"
@@ -812,7 +914,9 @@ def scan_vertical_spreads(
                 v_p1_bid = p1.get("bid_vol", 0.0) or 0.0
                 if v_p2_ask <= 0 or v_p1_bid <= 0:
                     continue
-                max_sets = int(min(v_p2_ask, v_p1_bid))
+                max_sets = _exec_sets(v_p2_ask, v_p1_bid)
+                if max_sets < 1:
+                    continue
 
                 p1_sym = p1.get("symbol") or f"S50{front_series}P{k1:.0f}"
                 p2_sym = p2.get("symbol") or f"S50{front_series}P{k2:.0f}"
@@ -900,8 +1004,12 @@ def scan_calendar_spreads(
         return [], None, dropped_invalid_quotes, calc_error_count, {}
 
     df_sp = pd.DataFrame(spread_records)
-    df_sp["rolling_mean"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).mean()
-    df_sp["rolling_std"] = df_sp["mid_spread"].rolling(window=30, min_periods=5).std()
+    # W4: baseline ต้องไม่รวมแท่งที่กำลังทดสอบ (shift(1)) ไม่งั้น spike จะกลบตัวเองใน mu
+    # และ z-score ถูก cap: ที่ min_periods=5 ค่า z สูงสุดที่เป็นไปได้คือ 1.789 < 2.0
+    # ทำให้ detector ยิงไม่ได้เลยในช่วงต้นรอบ
+    baseline_spread = df_sp["mid_spread"].shift(1)
+    df_sp["rolling_mean"] = baseline_spread.rolling(window=30, min_periods=5).mean()
+    df_sp["rolling_std"] = baseline_spread.rolling(window=30, min_periods=5).std()
 
     opportunities: List[Dict[str, Any]] = []
     best_near_miss: Optional[Dict[str, Any]] = None
@@ -918,100 +1026,99 @@ def scan_calendar_spreads(
             continue
 
         # Case 1: Spread Spikes UP -> Sell Front @ b1, Buy Next @ a2
-        if b1_vol <= 0 or a2_vol <= 0:
-            continue
-        max_sets_up = int(min(b1_vol, a2_vol))
+        # W3: เดิม `continue` ทำให้ Case 2 ไม่ถูกประเมินเลยเมื่อ bid ฝั่ง front ไม่มี depth
+        if b1_vol > 0 and a2_vol > 0:
+            max_sets_up = _exec_sets(b1_vol, a2_vol)
 
-        mid1 = (b1 + a1) / 2.0
-        mid2 = (b2 + a2) / 2.0
-        mid_spread = mid1 - mid2
-        mid_edge_up = mid_spread - mu
+            mid1 = (b1 + a1) / 2.0
+            mid2 = (b2 + a2) / 2.0
+            mid_spread = mid1 - mid2
+            mid_edge_up = mid_spread - mu
 
-        exec_sell_spread = b1 - a2
-        dev_up = exec_sell_spread - mu
-        if math.isnan(dev_up) or math.isinf(dev_up):
-            calc_error_count += 1
-            continue
-        net_up = dev_up - COMMISSION
-        spread_cost_up = mid_edge_up - dev_up
+            exec_sell_spread = b1 - a2
+            dev_up = exec_sell_spread - mu
+            if math.isnan(dev_up) or math.isinf(dev_up):
+                calc_error_count += 1
+                continue
+            net_up = dev_up - COMMISSION
+            spread_cost_up = mid_edge_up - dev_up
 
-        item_up = {
-            "strategy": "Calendar Spread Spike (Overextended High)",
-            "target": f"{f1_sym} - {f2_sym}",
-            "tag": "[Statistical Spread]",
-            "time": ts,
-            "series": f"{front_series}-{next_series}",
-            "gross_pts": dev_up,
-            "net_pts": net_up,
-            "mid_edge": mid_edge_up,
-            "spread_cost": spread_cost_up,
-            "commission_pts": COMMISSION,
-            "max_sets": max_sets_up,
-            "mu": mu,
-            "std": std,
-            "legs": [
-                f"Sell Front {f1_sym} @ Bid <code>{b1:.2f}</code> (Depth: {b1_vol:,.0f})",
-                f"Buy Next {f2_sym} @ Ask <code>{a2:.2f}</code> (Depth: {a2_vol:,.0f})"
-            ],
-            "order_legs": [
-                {"symbol": f1_sym, "side": "S", "price": b1, "depth": b1_vol, "is_futures": True},
-                {"symbol": f2_sym, "side": "L", "price": a2, "depth": a2_vol, "is_futures": True}
-            ],
-            "stats": f"Spread: {exec_sell_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_up:.2f} pts / +{(dev_up/std):.1f}σ)"
-        }
-        if ts not in minute_bests or net_up > minute_bests[ts]:
-            minute_bests[ts] = net_up
+            item_up = {
+                "strategy": "Calendar Spread Spike (Overextended High)",
+                "target": f"{f1_sym} - {f2_sym}",
+                "tag": "[Statistical Spread]",
+                "time": ts,
+                "series": f"{front_series}-{next_series}",
+                "gross_pts": dev_up,
+                "net_pts": net_up,
+                "mid_edge": mid_edge_up,
+                "spread_cost": spread_cost_up,
+                "commission_pts": COMMISSION,
+                "max_sets": max_sets_up,
+                "mu": mu,
+                "std": std,
+                "legs": [
+                    f"Sell Front {f1_sym} @ Bid <code>{b1:.2f}</code> (Depth: {b1_vol:,.0f})",
+                    f"Buy Next {f2_sym} @ Ask <code>{a2:.2f}</code> (Depth: {a2_vol:,.0f})"
+                ],
+                "order_legs": [
+                    {"symbol": f1_sym, "side": "S", "price": b1, "depth": b1_vol, "is_futures": True},
+                    {"symbol": f2_sym, "side": "L", "price": a2, "depth": a2_vol, "is_futures": True}
+                ],
+                "stats": f"Spread: {exec_sell_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_up:.2f} pts / +{(dev_up/std):.1f}σ)"
+            }
+            if ts not in minute_bests or net_up > minute_bests[ts]:
+                minute_bests[ts] = net_up
 
-        if exec_sell_spread > (mu + 2.0 * std) and net_up > 0:
-            opportunities.append(item_up)
-        if best_near_miss is None or net_up > best_near_miss["net_pts"]:
-            best_near_miss = item_up
+            if max_sets_up >= 1 and exec_sell_spread > (mu + 2.0 * std) and net_up > 0:
+                opportunities.append(item_up)
+            if best_near_miss is None or net_up > best_near_miss["net_pts"]:
+                best_near_miss = item_up
 
         # Case 2: Spread Spikes DOWN -> Buy Front @ a1, Sell Next @ b2
-        if a1_vol <= 0 or b2_vol <= 0:
-            continue
-        max_sets_down = int(min(a1_vol, b2_vol))
+        if a1_vol > 0 and b2_vol > 0:
+            max_sets_down = _exec_sets(a1_vol, b2_vol)
 
-        exec_buy_spread = a1 - b2
-        dev_down = mu - exec_buy_spread
-        mid_edge_down = mu - mid_spread
-        if math.isnan(dev_down) or math.isinf(dev_down):
-            calc_error_count += 1
-            continue
-        net_down = dev_down - COMMISSION
-        spread_cost_down = mid_edge_down - dev_down
+            exec_buy_spread = a1 - b2
+            dev_down = mu - exec_buy_spread
+            mid_edge_down = mu - mid_spread
+            if math.isnan(dev_down) or math.isinf(dev_down):
+                calc_error_count += 1
+                continue
+            net_down = dev_down - COMMISSION
+            spread_cost_down = mid_edge_down - dev_down
 
-        item_down = {
-            "strategy": "Calendar Spread Spike (Overextended Low)",
-            "target": f"{f1_sym} - {f2_sym}",
-            "tag": "[Statistical Spread]",
-            "time": ts,
-            "series": f"{front_series}-{next_series}",
-            "gross_pts": dev_down,
-            "net_pts": net_down,
-            "mid_edge": mid_edge_down,
-            "spread_cost": spread_cost_down,
-            "commission_pts": COMMISSION,
-            "max_sets": max_sets_down,
-            "mu": mu,
-            "std": std,
-            "legs": [
-                f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Depth: {a1_vol:,.0f})",
-                f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Depth: {b2_vol:,.0f})"
-            ],
-            "order_legs": [
-                {"symbol": f1_sym, "side": "L", "price": a1, "depth": a1_vol, "is_futures": True},
-                {"symbol": f2_sym, "side": "S", "price": b2, "depth": b2_vol, "is_futures": True}
-            ],
-            "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_down:.2f} pts / +{(dev_down/std):.1f}σ)"
-        }
-        if ts not in minute_bests or net_down > minute_bests[ts]:
-            minute_bests[ts] = net_down
+            item_down = {
+                "strategy": "Calendar Spread Spike (Overextended Low)",
+                "target": f"{f1_sym} - {f2_sym}",
+                "tag": "[Statistical Spread]",
+                "time": ts,
+                "series": f"{front_series}-{next_series}",
+                "gross_pts": dev_down,
+                "net_pts": net_down,
+                "mid_edge": mid_edge_down,
+                "spread_cost": spread_cost_down,
+                "commission_pts": COMMISSION,
+                "max_sets": max_sets_down,
+                "mu": mu,
+                "std": std,
+                "legs": [
+                    f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Depth: {a1_vol:,.0f})",
+                    f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Depth: {b2_vol:,.0f})"
+                ],
+                "order_legs": [
+                    {"symbol": f1_sym, "side": "L", "price": a1, "depth": a1_vol, "is_futures": True},
+                    {"symbol": f2_sym, "side": "S", "price": b2, "depth": b2_vol, "is_futures": True}
+                ],
+                "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_down:.2f} pts / +{(dev_down/std):.1f}σ)"
+            }
+            if ts not in minute_bests or net_down > minute_bests[ts]:
+                minute_bests[ts] = net_down
 
-        if exec_buy_spread < (mu - 2.0 * std) and net_down > 0:
-            opportunities.append(item_down)
-        if best_near_miss is None or net_down > best_near_miss["net_pts"]:
-            best_near_miss = item_down
+            if max_sets_down >= 1 and exec_buy_spread < (mu - 2.0 * std) and net_down > 0:
+                opportunities.append(item_down)
+            if best_near_miss is None or net_down > best_near_miss["net_pts"]:
+                best_near_miss = item_down
 
     return opportunities, best_near_miss, dropped_invalid_quotes, calc_error_count, minute_bests
 
@@ -1050,15 +1157,17 @@ def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool
     try:
         r = requests.post(url, json=payload, timeout=25)
         print(f"[TELEGRAM] HTTP Status: {r.status_code}")
-        print(f"[TELEGRAM] API Response: {r.text}")
         if r.status_code == 200 and r.json().get("ok"):
             print("[TELEGRAM] Arbitrage notification delivered successfully.")
             return True
         else:
-            print(f"[TELEGRAM] Error: sendMessage failed with HTTP {r.status_code}: {r.text}")
+            print(f"[TELEGRAM] Error: sendMessage failed with HTTP {r.status_code}: {r.text[:200]}")
             return False
     except Exception as e:
-        print(f"[TELEGRAM] Exception sending telegram notification: {e}")
+        # ห้าม log ตัว exception ดิบ: requests ใส่ URL เต็ม (ซึ่งมี bot token) ลงใน
+        # ข้อความของ ConnectionError/Timeout และ repo นี้เป็น public
+        # → log ของ GitHub Actions อ่านได้โดยใครก็ได้
+        print(f"[TELEGRAM] Exception sending alert: {type(e).__name__} (URL/token redacted)")
         return False
 
 
@@ -1093,7 +1202,7 @@ def send_telegram_document(
             print(f"[TELEGRAM] Error: sendDocument failed with HTTP {r.status_code}: {r.text}")
             return False
     except Exception as e:
-        print(f"[TELEGRAM] Exception sending telegram document: {e}")
+        print(f"[TELEGRAM] Exception sending document: {type(e).__name__} (URL/token redacted)")
         return False
 
 
@@ -1398,11 +1507,13 @@ def _recalculate_opp_math(
         if disc is None and thor_rate is not None and T_years is not None:
             disc = math.exp(-thor_rate * T_years)
         if disc is None:
+            print("[RECALC] disc_factor missing and THOR/T unavailable — assuming 1.0 "
+                  "(no discount); parity edge may be overstated on deep strikes")
             disc = 1.0
         gross = (c_bid - p_ask) - (f_ask - k) * disc
         net = gross - comm
-        max_sets = int(min(c_bvol, p_avol, f_avol))
-        return gross, net, max_sets
+        max_sets = _exec_sets(c_bvol, p_avol, f_avol)
+        return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     # Reversal
     if "Reversal" in strat:
@@ -1424,11 +1535,13 @@ def _recalculate_opp_math(
         if disc is None and thor_rate is not None and T_years is not None:
             disc = math.exp(-thor_rate * T_years)
         if disc is None:
+            print("[RECALC] disc_factor missing and THOR/T unavailable — assuming 1.0 "
+                  "(no discount); parity edge may be overstated on deep strikes")
             disc = 1.0
         gross = (f_bid - k) * disc - (c_ask - p_bid)
         net = gross - comm
-        max_sets = int(min(c_avol, p_bvol, f_bvol))
-        return gross, net, max_sets
+        max_sets = _exec_sets(c_avol, p_bvol, f_bvol)
+        return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     # Call Monotonicity
     if "Call Monotonicity" in strat:
@@ -1444,8 +1557,8 @@ def _recalculate_opp_math(
             return None, None, 0
         gross = s_bid - b_ask
         net = gross - comm
-        max_sets = int(min(b_avol, s_bvol))
-        return gross, net, max_sets
+        max_sets = _exec_sets(b_avol, s_bvol)
+        return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     # Put Monotonicity
     if "Put Monotonicity" in strat:
@@ -1461,8 +1574,8 @@ def _recalculate_opp_math(
             return None, None, 0
         gross = s_bid - b_ask
         net = gross - comm
-        max_sets = int(min(s_bvol, b_avol))
-        return gross, net, max_sets
+        max_sets = _exec_sets(s_bvol, b_avol)
+        return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     # Calendar Spread Spike High
     if "Calendar" in strat and "High" in strat:
@@ -1480,8 +1593,8 @@ def _recalculate_opp_math(
         exec_sell_spread = s_bid - b_ask
         gross = exec_sell_spread - mu
         net = gross - comm
-        max_sets = int(min(s_bvol, b_avol))
-        return gross, net, max_sets
+        max_sets = _exec_sets(s_bvol, b_avol)
+        return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     # Calendar Spread Spike Low
     if "Calendar" in strat and "Low" in strat:
@@ -1499,8 +1612,8 @@ def _recalculate_opp_math(
         exec_buy_spread = b_ask - s_bid
         gross = mu - exec_buy_spread
         net = gross - comm
-        max_sets = int(min(b_avol, s_bvol))
-        return gross, net, max_sets
+        max_sets = _exec_sets(b_avol, s_bvol)
+        return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     # General 2-leg fallback
     if len(legs) == 2:
@@ -1514,8 +1627,8 @@ def _recalculate_opp_math(
             if b_ask is not None and s_bid is not None:
                 gross = s_bid - b_ask
                 net = gross - comm
-                max_sets = int(min(b_avol, s_bvol))
-                return gross, net, max_sets
+                max_sets = _exec_sets(b_avol, s_bvol)
+                return (gross, net, max_sets) if max_sets >= 1 else (None, None, 0)
 
     return None, None, 0
 
@@ -1526,7 +1639,8 @@ def verify_live_quotes_before_alert(
     running_futures: Optional[Dict[str, Dict[str, Any]]] = None,
     running_options: Optional[Dict[Tuple[str, float, str], Dict[str, Any]]] = None,
     thor_rate: Optional[float] = None,
-    T_years: Optional[float] = None
+    T_years: Optional[float] = None,
+    require_rest: bool = True
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Pre-Alert REST Double-Check Gate:
@@ -1548,9 +1662,21 @@ def verify_live_quotes_before_alert(
         market_data = get_settrade_market_data()
 
     if market_data is None:
-        # No credentials configured; bypass in offline/replay mode
-        print("[REST-GUARD] Settrade MarketData not configured. Bypassing REST double-check.")
-        return True, opp
+        # Settrade is not configured / failed to initialize (expired secret, network,
+        # library missing). Previously this "bypassed" the gate and returned True,
+        # so alerts went out on DB quotes that can be 15 minutes stale while the
+        # message still claimed "REST Verified ✅". Fail closed unless explicitly
+        # opted out with --allow-unverified.
+        reason = "[REST-GUARD] Settrade MarketData unavailable — live quotes NOT verified."
+        if require_rest:
+            print(f"{reason} Suppressing alert (fail-closed). Use --allow-unverified to override.")
+            suppressed = dict(opp)
+            suppressed["rest_verified"] = False
+            return False, suppressed
+        print(f"{reason} Continuing WITHOUT verification (--allow-unverified). Alert is labelled DB-only.")
+        unverified = dict(opp)
+        unverified["rest_verified"] = False
+        return True, unverified
 
     legs = resolve_order_legs(opp)
     if not legs:
@@ -1691,6 +1817,7 @@ def verify_live_quotes_before_alert(
 
     updated_opp["order_legs"] = updated_order_legs
     updated_opp["legs"] = updated_text_legs
+    updated_opp["rest_verified"] = True
 
     print(f"[REST-GUARD] ✅ Verified live quotes via REST: {strat} {target} (Net: +{net:.2f} pts, Sets: {max_sets})")
     return True, updated_opp
@@ -2004,8 +2131,10 @@ def format_live_1min_alert(
                     f_be = k + (c_px - p_px + comm) / disc
                     be_hedge_line = f"\n  🎯 <b>Breakeven Fut Hedge:</b> <code>Short Fut &gt;= {f_be:.2f}</code> (ป้องกัน Legging Risk)"
 
+        verify_label = "REST Verified ✅" if opp.get("rest_verified") else "⚠️ DB-only — ยังไม่ verified"
+
         return (
-            f"<b>#1 {strat}</b> <code>{target}</code> | Net: 🟢 <b>+{net_pts:.2f} จุด (+{net_thb:,.0f} บ.)</b> | Max: <b>{max_sets}</b> ชุด (REST Verified ✅)\n"
+            f"<b>#1 {strat}</b> <code>{target}</code> | Net: 🟢 <b>+{net_pts:.2f} จุด (+{net_thb:,.0f} บ.)</b> | Max: <b>{max_sets}</b> ชุด ({verify_label})\n"
             + "\n".join(legs_lines)
             + be_hedge_line + "\n"
             + f"<code>{log_line}</code>"
@@ -2019,6 +2148,8 @@ def format_live_1min_alert(
         max_sets = int(opp.get("max_sets", 1))
 
         line1 = f"<b>#{idx} {strat}</b> <code>{target}</code> | Net: <b>+{net_pts:.2f} จุด (+{net_thb:,.0f} บ.)</b> | Max: {max_sets} ชุด"
+        if not opp.get("rest_verified"):
+            line1 += " ⚠️ <i>DB-only (ยังไม่ verified)</i>"
 
         legs = opp.get("order_legs") or resolve_order_legs(opp)
         sorted_legs = sorted(legs, key=lambda x: (1 if _is_fut(x) else 0, float(x.get("depth", 0.0))))
@@ -2324,7 +2455,8 @@ def format_telegram_report(
 # 7. WORKER LOOP & DISPATCH CONTROLLER
 # ==============================================================================
 
-def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_telegram: bool = False) -> None:
+def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_telegram: bool = False,
+                   allow_unverified: bool = False) -> None:
     """
     Persistent 1-Minute Real-time Session Worker:
     - Runs a continuous 1-minute loop synced with Turso (:06 offset / 3s polling).
@@ -2447,6 +2579,13 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     lifespan_tracker = OpportunityLifespanTracker()
     last_heartbeat_time = pytime.time()
     st_market_data = get_settrade_market_data()
+    require_rest = not allow_unverified
+    if st_market_data is None:
+        if require_rest:
+            print("[REST-GUARD] Settrade MarketData unavailable — live alerts will be SUPPRESSED "
+                  "(fail-closed). Pass --allow-unverified to alert on DB quotes only.")
+        else:
+            print("[REST-GUARD] --allow-unverified set: alerts will be labelled DB-only.")
 
     # --------------------------------------------------------------------------
     # Real-time Sub-Minute Live Loop (Polls Turso every 5 seconds)
@@ -2571,7 +2710,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                     if u_ts:
                         try:
                             u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
-                            if (curr_dt - u_dt).total_seconds() > 900:
+                            if (curr_dt - u_dt).total_seconds() > QUOTE_STALENESS_LIVE_SEC:
                                 del running_futures[sym]
                         except Exception:
                             pass
@@ -2581,7 +2720,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                     if u_ts:
                         try:
                             u_dt = datetime.datetime.strptime(u_ts[:19], "%Y-%m-%d %H:%M:%S")
-                            if (curr_dt - u_dt).total_seconds() > 900:
+                            if (curr_dt - u_dt).total_seconds() > QUOTE_STALENESS_LIVE_SEC:
                                 del running_options[key]
                         except Exception:
                             pass
@@ -2616,22 +2755,43 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                     alertable = cooldown.filter_alertable(bar_all_opps, curr_bkk, auto_record=False)
                     if alertable:
                         ranked_alertable = sorted(alertable, key=lambda x: x.get("net_pts", 0.0), reverse=True)
-                        top_1_opp = ranked_alertable[0]
 
-                        # Pre-Alert REST Double-Check Gate
-                        verified, updated_top_1 = verify_live_quotes_before_alert(
-                            opp=top_1_opp,
-                            market_data=st_market_data,
-                            running_futures=running_futures,
-                            running_options=running_options,
-                            thor_rate=thor_rate,
-                            T_years=T_years
-                        )
+                        # Pre-Alert REST Double-Check Gate.
+                        # W1: เดิม verify เฉพาะอันดับ #1 แต่ส่ง alert ทุกอันดับ ที่เหลือจึง
+                        # ออกไปด้วยราคา DB ที่เก่าได้ถึง 15 นาที โดยไม่มีป้ายบอก
+                        # แก้: verify อันดับต้น ๆ ทุกตัว (สูงสุด MAX_REST_VERIFIED_OPPS)
+                        # และติดป้าย DB-only ให้ตัวที่ยังไม่ได้ verify
+                        verified_ranked: List[Dict[str, Any]] = []
+                        for cand in ranked_alertable[:MAX_REST_VERIFIED_OPPS]:
+                            ok, upd = verify_live_quotes_before_alert(
+                                opp=cand,
+                                market_data=st_market_data,
+                                running_futures=running_futures,
+                                running_options=running_options,
+                                thor_rate=thor_rate,
+                                T_years=T_years,
+                                require_rest=require_rest
+                            )
+                            if ok:
+                                verified_ranked.append(upd)
+                            else:
+                                print(f"[REST-GUARD] Filtered ghost/stale opportunity ({cand.get('strategy')} - {cand.get('target')}).")
 
-                        if not verified:
-                            print(f"[REST-GUARD] Filtered ghost/stale opportunity ({top_1_opp.get('strategy')} - {top_1_opp.get('target')}). Suppressing LIVE Telegram alert.")
+                        if not verified_ranked:
+                            print(f"[REST-GUARD] No candidate survived REST verification ({len(ranked_alertable)} suppressed). Suppressing LIVE Telegram alert.")
                         else:
-                            ranked_alertable[0] = updated_top_1
+                            tail = [
+                                dict(o, rest_verified=bool(o.get("rest_verified")))
+                                for o in ranked_alertable[MAX_REST_VERIFIED_OPPS:]
+                            ]
+                            for o in tail:
+                                o["rest_verified"] = False
+                            ranked_alertable = sorted(
+                                verified_ranked + tail,
+                                key=lambda x: x.get("net_pts", 0.0),
+                                reverse=True
+                            )
+                            top_1_opp = ranked_alertable[0]
                             print(f"[TELEGRAM] 🚨 Dispatching LIVE Event Alert for {len(ranked_alertable)} opportunities...")
                             live_msg = format_live_1min_alert(
                                 trade_date=trade_date,
@@ -2649,12 +2809,12 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                                     cooldown.record_alert(opp_alerted, curr_bkk)
 
                                 # Generate & attach Settrade Streaming Multiple Order Excel file for Top 1 pure arbitrage opportunity
-                                if "Calendar" not in updated_top_1.get("strategy", ""):
+                                if "Calendar" not in top_1_opp.get("strategy", "") and top_1_opp.get("rest_verified"):
                                     try:
-                                        xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(updated_top_1)
+                                        xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(top_1_opp)
                                         doc_caption = (
-                                            f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{updated_top_1['strategy']}</code> | "
-                                            f"<code>{updated_top_1['target']}</code> (Net: <b>+{updated_top_1['net_pts']:.2f} pts</b>)\n"
+                                            f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{top_1_opp['strategy']}</code> | "
+                                            f"<code>{top_1_opp['target']}</code> (Net: <b>+{top_1_opp['net_pts']:.2f} pts</b>)\n"
                                             f"⚡ <i>นำเข้าเมนู Multiple Order บน Settrade Streaming เพื่อส่งคำสั่งพร้อมกัน</i>"
                                         )
                                         send_telegram_document(tg_token, tg_chat_id, xlsx_bytes, xlsx_filename, caption=doc_caption)
@@ -2881,15 +3041,22 @@ if __name__ == "__main__":
         "--session",
         type=str.upper,
         choices=["MIDDAY", "EVENING", "MORNING_WORKER", "AFTERNOON_WORKER"],
-        default="MIDDAY",
+        required=True,
         help="Execution session mode (MIDDAY, EVENING, MORNING_WORKER, AFTERNOON_WORKER)"
     )
     parser.add_argument("--date", type=str, default=None, help="Target trade date (YYYY-MM-DD, default today)")
     parser.add_argument("--no-telegram", action="store_true", help="Skip sending Telegram alert")
+    parser.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="ยอมให้แจ้งเตือนด้วยราคาจาก DB โดยไม่ผ่าน Settrade REST verification "
+             "(alert จะติดป้าย DB-only); ค่าเริ่มต้นคือ fail-closed"
+    )
     args = parser.parse_args()
 
     if args.session in ["MORNING_WORKER", "AFTERNOON_WORKER"]:
-        run_arb_worker(session_mode=args.session, target_date=args.date, no_telegram=args.no_telegram)
+        run_arb_worker(session_mode=args.session, target_date=args.date,
+                       no_telegram=args.no_telegram, allow_unverified=args.allow_unverified)
     elif args.session in ["MIDDAY", "EVENING"]:
         run_single_scan(session_name=args.session, target_date=args.date, no_telegram=args.no_telegram)
     else:
