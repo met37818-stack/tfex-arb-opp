@@ -30,6 +30,7 @@ Strict Fail-Loud / No Silent Fallback Rules:
 
 import os
 import sys
+import io
 import re
 import math
 import calendar
@@ -43,6 +44,7 @@ import requests
 import pytz
 import numpy as np
 import pandas as pd
+import openpyxl
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -572,6 +574,8 @@ def scan_put_call_parity(
                 if gross_conv is not None:
                     net_conv = gross_conv - COMMISSION
                     spread_cost_conv = mid_edge_conv - gross_conv
+                    c_sym = c_quote.get("symbol") or f"S50{front_series}C{k:.0f}"
+                    p_sym = p_quote.get("symbol") or f"S50{front_series}P{k:.0f}"
                     item_conv = {
                         "strategy": "Conversion (Sell C, Buy P, Buy Fut)",
                         "target": f"Strike {k:.0f} & {fut_sym}",
@@ -589,6 +593,11 @@ def scan_put_call_parity(
                             f"Sell Call {k:.0f} @ Bid <code>{c_bid:.2f}</code> (Depth: {c_bvol:,.0f})",
                             f"Buy Put {k:.0f} @ Ask <code>{p_ask:.2f}</code> (Depth: {p_avol:,.0f})",
                             f"Buy Futures {fut_sym} @ Ask <code>{f_ask:.2f}</code> (Depth: {f_avol:,.0f})"
+                        ],
+                        "order_legs": [
+                            {"symbol": c_sym, "side": "S", "price": c_bid, "depth": c_bvol, "is_futures": False},
+                            {"symbol": p_sym, "side": "L", "price": p_ask, "depth": p_avol, "is_futures": False},
+                            {"symbol": fut_sym, "side": "L", "price": f_ask, "depth": f_avol, "is_futures": True}
                         ]
                     }
                     if ts not in minute_bests or net_conv > minute_bests[ts]:
@@ -636,6 +645,11 @@ def scan_put_call_parity(
                             f"Buy Call {k:.0f} @ Ask <code>{c_ask:.2f}</code> (Depth: {c_avol:,.0f})",
                             f"Sell Put {k:.0f} @ Bid <code>{p_bid:.2f}</code> (Depth: {p_bvol:,.0f})",
                             f"Sell Futures {fut_sym} @ Bid <code>{f_bid:.2f}</code> (Depth: {f_bvol:,.0f})"
+                        ],
+                        "order_legs": [
+                            {"symbol": c_sym, "side": "L", "price": c_ask, "depth": c_avol, "is_futures": False},
+                            {"symbol": p_sym, "side": "S", "price": p_bid, "depth": p_bvol, "is_futures": False},
+                            {"symbol": fut_sym, "side": "S", "price": f_bid, "depth": f_bvol, "is_futures": True}
                         ]
                     }
                     if ts not in minute_bests or net_rev > minute_bests[ts]:
@@ -697,6 +711,8 @@ def scan_vertical_spreads(
                     continue
                 max_sets = int(min(v_c1_ask, v_c2_bid))
 
+                c1_sym = c1.get("symbol") or f"S50{front_series}C{k1:.0f}"
+                c2_sym = c2.get("symbol") or f"S50{front_series}C{k2:.0f}"
                 item = {
                     "strategy": "Call Monotonicity Violation",
                     "target": f"Call {k1:.0f}/{k2:.0f} ({front_series})",
@@ -713,6 +729,10 @@ def scan_vertical_spreads(
                     "legs": [
                         f"Buy Call {k1:.0f} @ Ask <code>{c1['ask']:.2f}</code> (Depth: {v_c1_ask:,.0f})",
                         f"Sell Call {k2:.0f} @ Bid <code>{c2['bid']:.2f}</code> (Depth: {v_c2_bid:,.0f})"
+                    ],
+                    "order_legs": [
+                        {"symbol": c1_sym, "side": "L", "price": c1["ask"], "depth": v_c1_ask, "is_futures": False},
+                        {"symbol": c2_sym, "side": "S", "price": c2["bid"], "depth": v_c2_bid, "is_futures": False}
                     ]
                 }
                 if ts not in minute_bests or net > minute_bests[ts]:
@@ -756,6 +776,8 @@ def scan_vertical_spreads(
                     continue
                 max_sets = int(min(v_p2_ask, v_p1_bid))
 
+                p1_sym = p1.get("symbol") or f"S50{front_series}P{k1:.0f}"
+                p2_sym = p2.get("symbol") or f"S50{front_series}P{k2:.0f}"
                 item = {
                     "strategy": "Put Monotonicity Violation",
                     "target": f"Put {k1:.0f}/{k2:.0f} ({front_series})",
@@ -772,6 +794,10 @@ def scan_vertical_spreads(
                     "legs": [
                         f"Buy Put {k2:.0f} @ Ask <code>{p2['ask']:.2f}</code> (Depth: {v_p2_ask:,.0f})",
                         f"Sell Put {k1:.0f} @ Bid <code>{p1['bid']:.2f}</code> (Depth: {v_p1_bid:,.0f})"
+                    ],
+                    "order_legs": [
+                        {"symbol": p2_sym, "side": "L", "price": p2["ask"], "depth": v_p2_ask, "is_futures": False},
+                        {"symbol": p1_sym, "side": "S", "price": p1["bid"], "depth": v_p1_bid, "is_futures": False}
                     ]
                 }
                 if ts not in minute_bests or net > minute_bests[ts]:
@@ -883,6 +909,10 @@ def scan_calendar_spreads(
                 f"Sell Front {f1_sym} @ Bid <code>{b1:.2f}</code> (Depth: {b1_vol:,.0f})",
                 f"Buy Next {f2_sym} @ Ask <code>{a2:.2f}</code> (Depth: {a2_vol:,.0f})"
             ],
+            "order_legs": [
+                {"symbol": f1_sym, "side": "S", "price": b1, "depth": b1_vol, "is_futures": True},
+                {"symbol": f2_sym, "side": "L", "price": a2, "depth": a2_vol, "is_futures": True}
+            ],
             "stats": f"Spread: {exec_sell_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_up:.2f} pts / +{(dev_up/std):.1f}σ)"
         }
         if ts not in minute_bests or net_up > minute_bests[ts]:
@@ -922,6 +952,10 @@ def scan_calendar_spreads(
             "legs": [
                 f"Buy Front {f1_sym} @ Ask <code>{a1:.2f}</code> (Depth: {a1_vol:,.0f})",
                 f"Sell Next {f2_sym} @ Bid <code>{b2:.2f}</code> (Depth: {b2_vol:,.0f})"
+            ],
+            "order_legs": [
+                {"symbol": f1_sym, "side": "L", "price": a1, "depth": a1_vol, "is_futures": True},
+                {"symbol": f2_sym, "side": "S", "price": b2, "depth": b2_vol, "is_futures": True}
             ],
             "stats": f"Spread: {exec_buy_spread:+.2f} vs Baseline: {mu:+.2f} (+{dev_down:.2f} pts / +{(dev_down/std):.1f}σ)"
         }
@@ -980,6 +1014,168 @@ def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool
     except Exception as e:
         print(f"[TELEGRAM] Exception sending telegram notification: {e}")
         return False
+
+
+def send_telegram_document(
+    bot_token: str,
+    chat_id: str,
+    file_bytes: bytes,
+    filename: str,
+    caption: Optional[str] = None
+) -> bool:
+    """
+    Sends a file (e.g. .xlsx Multiple Order template) to Telegram using sendDocument API.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    files = {
+        "document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    }
+    data = {
+        "chat_id": chat_id
+    }
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "HTML"
+
+    try:
+        r = requests.post(url, data=data, files=files, timeout=25)
+        print(f"[TELEGRAM] sendDocument Status: {r.status_code}")
+        if r.status_code == 200 and r.json().get("ok"):
+            print(f"[TELEGRAM] Streaming Multi-Order document '{filename}' delivered successfully.")
+            return True
+        else:
+            print(f"[TELEGRAM] Error: sendDocument failed with HTTP {r.status_code}: {r.text}")
+            return False
+    except Exception as e:
+        print(f"[TELEGRAM] Exception sending telegram document: {e}")
+        return False
+
+
+def resolve_order_legs(opp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extracts or resolves order legs for Settrade Streaming Multiple Order.
+    Returns list of dicts: {'symbol': str, 'side': 'L'|'S', 'price': float, 'depth': float, 'is_futures': bool}
+    """
+    if "order_legs" in opp and opp["order_legs"]:
+        return [dict(leg) for leg in opp["order_legs"]]
+
+    # Fallback parser from text legs in opp.get("legs", [])
+    resolved = []
+    series = opp.get("series", "Z26")
+    if "-" in str(series):
+        series_parts = str(series).split("-")
+        front_ser = series_parts[0]
+        next_ser = series_parts[1]
+    else:
+        front_ser = str(series)
+        next_ser = ""
+
+    legs_text = opp.get("legs", [])
+    for leg_str in legs_text:
+        clean_text = leg_str.strip()
+        side = "L" if (clean_text.startswith("Buy") or "Buy " in clean_text) else "S"
+        is_fut = ("Futures" in clean_text) or ("Front" in clean_text) or ("Next" in clean_text)
+
+        price_m = re.search(r"<code>([0-9.]+)</code>", clean_text)
+        price = float(price_m.group(1)) if price_m else 0.0
+
+        depth_m = re.search(r"Depth:\s*([0-9,.]+)", clean_text)
+        depth = float(depth_m.group(1).replace(",", "")) if depth_m else 0.0
+
+        sym = ""
+        if is_fut:
+            fut_m = re.search(r"(S50[A-Z0-9]+)", clean_text)
+            if fut_m:
+                sym = fut_m.group(1)
+            elif "Next" in clean_text and next_ser:
+                sym = f"S50{next_ser}"
+            else:
+                sym = f"S50{front_ser}"
+        else:
+            opt_m = re.search(r"(Call|Put)\s+([0-9.]+)", clean_text, re.IGNORECASE)
+            if opt_m:
+                otype = "C" if opt_m.group(1).lower() == "call" else "P"
+                strike_num = float(opt_m.group(2))
+                sym = f"S50{front_ser}{otype}{strike_num:.0f}"
+            else:
+                sym = f"S50{front_ser}"
+
+        resolved.append({
+            "symbol": sym,
+            "side": side,
+            "price": price,
+            "depth": depth,
+            "is_futures": is_fut
+        })
+
+    return resolved
+
+
+def generate_streaming_multi_order_xlsx(opp: Dict[str, Any]) -> Tuple[bytes, str]:
+    """
+    Generates a Settrade Streaming Multiple Order import Excel (.xlsx) file in-memory.
+    Columns: Symbol, Side, Volume, Price, Position, Type, Validity, Iceberg
+
+    Safety Constraints:
+    - Volume: 1 (always 1 set)
+    - Position: "A" (Auto)
+    - Type: "Limit"
+    - Validity: "FOK" (Fill or Kill)
+    - Iceberg: None (empty)
+    - Side: "L" for Buy (Ask), "S" for Sell (Bid)
+    - Price: Execution price (Ask for Buy, Bid for Sell)
+
+    Critical Execution Order (Reduce Legging Risk):
+    - Options sorted ascending by liquidity depth (least liquid first)
+    - Futures (e.g. S50Z26) ALWAYS placed last
+
+    Returns:
+    - (file_bytes, filename)
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "MultipleOrder"
+
+    headers = ["Symbol", "Side", "Volume", "Price", "Position", "Type", "Validity", "Iceberg"]
+    ws.append(headers)
+
+    legs = resolve_order_legs(opp)
+    if not legs:
+        raise ValueError(f"No order legs found for opportunity: {opp}")
+
+    # Sort legs: Options first (is_futures=0) by depth ascending, Futures last (is_futures=1) by depth ascending
+    sorted_legs = sorted(legs, key=lambda x: (1 if x.get("is_futures") else 0, float(x.get("depth", 0.0))))
+
+    for leg in sorted_legs:
+        sym = str(leg["symbol"])
+        side_val = str(leg["side"]).upper()
+        side = "L" if side_val in ("L", "BUY", "LONG") else "S"
+        vol = 1
+        price = float(leg["price"])
+        pos = "A"
+        ord_type = "Limit"
+        validity = "FOK"
+        iceberg = None
+
+        ws.append([sym, side, vol, price, pos, ord_type, validity, iceberg])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    file_bytes = buf.getvalue()
+    buf.close()
+
+    strat = opp.get("strategy", "Arb")
+    target = opp.get("target", "Target")
+    time_val = opp.get("time", "")
+    time_tag = re.sub(r"[^0-9]", "", str(time_val))[-6:]
+    if len(time_tag) < 6:
+        time_tag = datetime.datetime.now(BANGKOK_TZ).strftime("%H%M%S")
+
+    clean_strat = re.sub(r"[^a-zA-Z0-9]+", "_", strat).strip("_")
+    clean_target = re.sub(r"[^a-zA-Z0-9]+", "_", target).strip("_")
+    filename = f"ARB_{clean_strat}_{clean_target}_{time_tag}.xlsx"
+
+    return file_bytes, filename
 
 
 def is_executable_market_hours(dt_or_time: Any) -> bool:
@@ -1792,6 +1988,19 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                         )
                         if not no_telegram and tg_token and tg_chat_id:
                             send_telegram_alert(tg_token, tg_chat_id, live_msg)
+                            # Generate & attach Settrade Streaming Multiple Order Excel file for Top 1 opportunity
+                            try:
+                                ranked_alertable = sorted(alertable, key=lambda x: x.get("net_pts", 0.0), reverse=True)
+                                top_1_opp = ranked_alertable[0]
+                                xlsx_bytes, xlsx_filename = generate_streaming_multi_order_xlsx(top_1_opp)
+                                doc_caption = (
+                                    f"📥 <b>Streaming Multi-Order (Top 1):</b> <code>{top_1_opp['strategy']}</code> | "
+                                    f"<code>{top_1_opp['target']}</code> (Net: <b>+{top_1_opp['net_pts']:.2f} pts</b>)\n"
+                                    f"⚡ <i>นำเข้าเมนู Multiple Order บน Settrade Streaming เพื่อส่งคำสั่งพร้อมกัน</i>"
+                                )
+                                send_telegram_document(tg_token, tg_chat_id, xlsx_bytes, xlsx_filename, caption=doc_caption)
+                            except Exception as e:
+                                print(f"[EXCEL] Error generating/sending Streaming Multi-Order xlsx: {e}")
                     else:
                         print(f"[COOLDOWN] {len(bar_all_opps)} opps detected but held in anti-spam cooldown.")
 
