@@ -400,9 +400,10 @@ def test_is_executable_market_hours():
 
     # Lunch break
     assert is_executable_market_hours(dt_time(13, 0, 0)) is False
-    assert is_executable_market_hours(dt_time(14, 14, 59)) is False
+    assert is_executable_market_hours(dt_time(13, 44, 59)) is False
 
-    # Afternoon session: 14:15:00 - 16:55:00
+    # Afternoon session: 13:45:00 - 16:55:00
+    assert is_executable_market_hours(dt_time(13, 45, 0)) is True
     assert is_executable_market_hours(dt_time(14, 15, 0)) is True
     assert is_executable_market_hours(dt_time(15, 45, 30)) is True
     assert is_executable_market_hours(dt_time(16, 55, 0)) is True
@@ -419,7 +420,7 @@ def test_is_executable_market_hours():
     assert is_executable_market_hours(dt_active) is True
     assert is_executable_market_hours(dt_post) is False
 
-    print("✅ Market Hours Guard Verified (Active 09:45-12:30 & 14:15-16:55, Suppressed 16:55-17:05)")
+    print("✅ Market Hours Guard Verified (Active 09:45-12:30 & 13:45-16:55, Suppressed 16:55-17:05)")
 
 
 def test_sub_minute_coalescing_in_best_of_minute_stats():

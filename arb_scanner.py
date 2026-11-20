@@ -1183,7 +1183,7 @@ def is_executable_market_hours(dt_or_time: Any) -> bool:
     Market Hours Guard:
     Checks if given datetime or time is within actual executable trading hours:
     - Morning: 09:45:00 - 12:30:00
-    - Afternoon: 14:15:00 - 16:55:00
+    - Afternoon: 13:45:00 - 16:55:00
     Returns False outside these windows (e.g. 16:55:01 - 17:05:00 is post-market when MMs withdraw quotes).
     """
     if isinstance(dt_or_time, datetime.datetime):
@@ -1194,7 +1194,7 @@ def is_executable_market_hours(dt_or_time: Any) -> bool:
         return False
 
     is_morning = (time(9, 45, 0) <= t <= time(12, 30, 0))
-    is_afternoon = (time(14, 15, 0) <= t <= time(16, 55, 0))
+    is_afternoon = (time(13, 45, 0) <= t <= time(16, 55, 0))
     return is_morning or is_afternoon
 
 
@@ -1750,16 +1750,16 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     # Session boundaries
     if session_mode == "MORNING_WORKER":
         session_start_time = time(9, 45, 0)
-        session_end_time = time(12, 35, 0)
+        session_end_time = time(12, 30, 5)
         summary_start_str = "09:45:00"
-        summary_end_str = "12:35:00"
-        summary_title = "สรุปภาพรวมช่วงเช้า (09:45–12:35 น.)"
+        summary_end_str = "12:30:05"
+        summary_title = "สรุปภาพรวมช่วงเช้า (09:45–12:30 น.)"
     elif session_mode == "AFTERNOON_WORKER":
-        session_start_time = time(14, 15, 0)
-        session_end_time = time(17, 5, 0)
+        session_start_time = time(13, 45, 0)
+        session_end_time = time(16, 55, 5)
         summary_start_str = "09:45:00"
-        summary_end_str = "17:05:00"
-        summary_title = "สรุปภาพรวมทั้งวัน (09:45–17:05 น.)"
+        summary_end_str = "16:55:05"
+        summary_title = "สรุปภาพรวมทั้งวัน (09:45–16:55 น.)"
     else:
         print(f"[ERROR] Invalid worker session: '{session_mode}'. Must be MORNING_WORKER or AFTERNOON_WORKER.")
         sys.exit(1)
@@ -2132,12 +2132,12 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
     sess_upper = session_name.upper()
     if sess_upper == "MIDDAY":
         t_start_bkk = "09:45:00"
-        t_end_bkk = "12:35:00"
-        sess_title = "พักเที่ยง (09:45–12:35 น.)"
+        t_end_bkk = "12:30:05"
+        sess_title = "พักเที่ยง (09:45–12:30 น.)"
     elif sess_upper == "EVENING":
         t_start_bkk = "09:45:00"
-        t_end_bkk = "17:05:00"
-        sess_title = "ปิดตลาดเย็น (09:45–17:05 น.)"
+        t_end_bkk = "16:55:05"
+        sess_title = "ปิดตลาดเย็น (09:45–16:55 น.)"
     else:
         print(f"[ERROR] Unsupported single scan session: '{session_name}'. Expected 'MIDDAY' or 'EVENING'.")
         sys.exit(1)
