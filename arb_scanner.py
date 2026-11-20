@@ -33,14 +33,12 @@ import sys
 import io
 import re
 import math
-import calendar
 import argparse
 import datetime
 import time as pytime
 from datetime import date, time, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 
-import requests
 import pytz
 import numpy as np
 import pandas as pd
@@ -55,21 +53,40 @@ except ImportError:
 
 load_dotenv()
 
+from tfex_common.calendar import (  # noqa: E402
+    MONTH_CODES,
+    REVERSE_MONTH_CODES,
+    SET_HOLIDAYS,
+    get_contract_last_trading_day,
+    get_penultimate_business_day,
+    parse_series_expiry,
+    resolve_active_series_candidates,
+)
+from tfex_common.constants import (  # noqa: E402
+    COMMISSION_2LEG_PTS,
+    COMMISSION_3LEG_PTS,
+    COMMISSION_4LEG_PTS,
+    COMMISSION_PER_LEG_PTS,
+    CONTRACT_MULTIPLIER,
+    FEE_PER_SIDE_THB,
+    THOR_MAX_PCT,
+)
+from tfex_common.telegram import send_alert as send_telegram_alert  # noqa: E402
+from tfex_common.telegram import send_document as send_telegram_document  # noqa: E402
+from tfex_common.thor import fetch_thor_rates_record  # noqa: E402
+from tfex_common.thor import select_dynamic_thor_rate  # noqa: E402
+from tfex_common.thor import to_decimal_rate as _to_decimal_rate  # noqa: E402
+from tfex_common.turso import execute_sql as execute_turso_sql  # noqa: E402
+from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
+# Calendar / THOR / Turso / Telegram now live in tfex_common (pinned to a tag in
+# requirements.txt). BANGKOK_TZ stays local: it is a pytz zone with .localize(),
+# which the package's fixed-offset tzinfo does not provide.
+
 BANGKOK_TZ = pytz.timezone("Asia/Bangkok")
-CONTRACT_MULTIPLIER = 200.0  # THB per SET50 index point
 
-# Fee & Commission Settings (Lock 20.0 THB/side = 40.0 THB round-turn per leg = 0.20 index pts/leg)
-FEE_PER_SIDE_THB = float(os.getenv("FEE_PER_SIDE_THB", "20.0"))
-COMMISSION_PER_LEG_PTS = (2.0 * FEE_PER_SIDE_THB) / CONTRACT_MULTIPLIER  # 0.20 index pts
-COMMISSION_2LEG_PTS = 2.0 * COMMISSION_PER_LEG_PTS   # 0.40 index pts (80 THB)
-COMMISSION_3LEG_PTS = 3.0 * COMMISSION_PER_LEG_PTS   # 0.60 index pts (120 THB)
-COMMISSION_4LEG_PTS = 4.0 * COMMISSION_PER_LEG_PTS   # 0.80 index pts (160 THB)
-
-# THOR (BOT) publishes rates as PERCENT per annum (e.g. 0.994 == 0.994%).
-# Never infer the unit from magnitude: 0.45% would be read as 45% and the
-# discount factor exp(-r*T) collapses, fabricating parity edges of several
-# index points on deep strikes.
-THOR_MAX_PCT = 25.0
+# Fees/commissions, THOR bound, SET holidays, quarterly month codes and the Turso
+# client all come from tfex_common (import block above) so the four TFEX repos share
+# one implementation. Constants below are specific to this scanner.
 
 # How many of the top-ranked opportunities get re-quoted against Settrade REST
 # before a live alert. Rank 1 alone used to be verified while ranks 2+ were
@@ -84,131 +101,7 @@ MAX_REST_VERIFIED_OPPS = 3
 QUOTE_STALENESS_LIVE_SEC = 120
 QUOTE_STALENESS_BACKFILL_SEC = 900
 
-MONTH_CODES = {3: "H", 6: "M", 9: "U", 12: "Z"}
-REVERSE_MONTH_CODES = {"H": 3, "M": 6, "U": 9, "Z": 12}
-
-# Official SET Holidays (2026 - 2028)
-SET_HOLIDAYS = {
-    # 2026
-    "2026-01-01", "2026-01-02", "2026-03-03", "2026-04-06", "2026-04-13",
-    "2026-04-14", "2026-04-15", "2026-05-01", "2026-05-04", "2026-06-01",
-    "2026-06-03", "2026-07-28", "2026-07-29", "2026-08-12", "2026-10-13",
-    "2026-10-16", "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
-    # 2027
-    "2027-01-01", "2027-02-22", "2027-04-06", "2027-04-13", "2027-04-14",
-    "2027-04-15", "2027-05-03", "2027-05-04", "2027-05-20", "2027-06-03",
-    "2027-07-19", "2027-07-28", "2027-08-12", "2027-10-13", "2027-10-25",
-    "2027-12-06", "2027-12-10", "2027-12-31",
-    # 2028
-    "2028-01-03", "2028-02-10", "2028-04-06", "2028-04-13", "2028-04-14",
-    "2028-05-01", "2028-05-05", "2028-06-05", "2028-07-17", "2028-07-28",
-    "2028-08-14", "2028-10-13", "2028-10-23", "2028-12-05", "2028-12-11"
-}
-
-
-# ==============================================================================
-# 1. TURSO HTTP PIPELINE CLIENT
-# ==============================================================================
-
-def to_turso_arg(val: Any) -> Dict[str, Any]:
-    if val is None:
-        return {"type": "null"}
-    if isinstance(val, bool):
-        return {"type": "integer", "value": str(int(val))}
-    if isinstance(val, int):
-        return {"type": "integer", "value": str(val)}
-    if isinstance(val, float):
-        if math.isnan(val) or math.isinf(val):
-            return {"type": "null"}
-        return {"type": "float", "value": val}
-    return {"type": "text", "value": str(val)}
-
-
-def parse_turso_result_rows(res: Dict[str, Any]) -> List[List[Any]]:
-    rows = []
-    for raw_row in res.get("rows", []):
-        row_vals = []
-        for cell in raw_row:
-            v_type = cell.get("type")
-            if v_type == "null":
-                row_vals.append(None)
-            elif v_type == "integer":
-                row_vals.append(int(cell.get("value", 0)))
-            elif v_type == "float":
-                row_vals.append(float(cell.get("value", 0.0)))
-            else:
-                row_vals.append(cell.get("value"))
-        rows.append(row_vals)
-    return rows
-
-
-def execute_turso_sql(
-    pipeline_url: str,
-    auth_token: str,
-    sql: str,
-    args: Optional[List[Any]] = None,
-    max_attempts: int = 3
-) -> Tuple[List[str], List[List[Any]]]:
-    """
-    Executes SQL via Turso v2 pipeline.
-
-    Transient failures (network errors, HTTP 429/5xx) retry with exponential
-    backoff, honouring Retry-After up to 30s — a 5xx from Turso used to kill the
-    whole scan tick / the worker at startup. SQL errors (syntax, constraint)
-    are NOT retried: they are deterministic and would just burn the timeout.
-    """
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
-    }
-    stmt = {"sql": sql.strip()}
-    if args:
-        stmt["args"] = [to_turso_arg(a) for a in args]
-    payload = {
-        "requests": [
-            {"type": "execute", "stmt": stmt},
-            {"type": "close"}
-        ]
-    }
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            r = requests.post(pipeline_url, json=payload, headers=headers, timeout=25)
-        except requests.RequestException as exc:
-            last_exc = exc
-            delay = min(2.0 ** (attempt - 1), 8.0)
-        else:
-            if r.status_code == 429 or r.status_code >= 500:
-                last_exc = RuntimeError(f"Turso API HTTP error ({r.status_code}): {r.text[:200]}")
-                retry_after = (r.headers.get("Retry-After") or "").strip()
-                delay = min(float(retry_after), 30.0) if retry_after.replace(".", "", 1).isdigit() \
-                    else min(2.0 ** (attempt - 1), 8.0)
-            elif r.status_code != 200:
-                raise RuntimeError(f"Turso API HTTP error ({r.status_code}): {r.text[:200]}")
-            else:
-                data = r.json()
-                for resp_item in data.get("results", []):
-                    if resp_item.get("type") == "error":
-                        # deterministic — retrying cannot help
-                        raise RuntimeError(f"Turso SQL execution error: {resp_item.get('error')}")
-                    if resp_item.get("type") == "ok":
-                        res = resp_item["response"]["result"]
-                        cols = [c["name"] for c in res.get("cols", [])]
-                        rows = parse_turso_result_rows(res)
-                        return cols, rows
-                return [], []
-
-        if attempt >= max_attempts:
-            break
-        print(f"[TURSO] {type(last_exc).__name__} on attempt {attempt}/{max_attempts}: "
-              f"{str(last_exc)[:120]} — retry in {delay:.0f}s")
-        pytime.sleep(delay)
-
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("Turso request failed without a captured error")
-
+# Section 1 (Turso HTTP pipeline client) moved to tfex_common.turso.
 
 # ==============================================================================
 # 2. CONCURRENCY GUARD & HEARTBEAT
@@ -274,155 +167,13 @@ def record_arb_heartbeat(
 
 
 # ==============================================================================
-# 3. DYNAMIC SERIES & EXPIRATION CALCULATION
-# ==============================================================================
-
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> date:
-    """
-    Calculate the penultimate business day of a given month.
-    (TFEX contract specification for SET50 Futures & Options expiration).
-    """
-    if not any(str(h).startswith(str(year)) for h in holidays):
-        print(f"[CALENDAR] WARNING: SET_HOLIDAYS has no data for {year} — expiry date for "
-              f"{year}-{month:02d} may be wrong. Update SET_HOLIDAYS before trading that year.")
-
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = [
-        date(year, month, d)
-        for d in range(1, last_day + 1)
-        if date(year, month, d).weekday() < 5 and date(year, month, d).strftime("%Y-%m-%d") not in holidays
-    ]
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else date(year, month, last_day)
-    return biz_days[-2]
 
 
-def get_contract_last_trading_day(year: int, month: int) -> datetime.datetime:
-    ltd = get_penultimate_business_day(year, month, SET_HOLIDAYS)
-    return BANGKOK_TZ.localize(datetime.datetime(ltd.year, ltd.month, ltd.day, 16, 30, 0))
-
-
-def resolve_active_series_candidates(now_bkk: datetime.datetime) -> Tuple[List[str], str, str]:
-    curr_year = now_bkk.year
-    candidates = []
-    for y in [curr_year, curr_year + 1]:
-        for m in [3, 6, 9, 12]:
-            ltd = get_contract_last_trading_day(y, m)
-            if ltd > now_bkk:
-                candidates.append((ltd, f"{MONTH_CODES[m]}{str(y)[-2:]}"))
-
-    candidates.sort(key=lambda x: x[0])
-    series_list = [c[1] for c in candidates[:4]]
-    front_series = series_list[0] if series_list else "Z26"
-    next_series = series_list[1] if len(series_list) > 1 else "H27"
-    return series_list, front_series, next_series
-
-
-def parse_series_expiry(series_code: str, ref_date: date) -> datetime.datetime:
-    month_char = series_code[0].upper()
-    month = REVERSE_MONTH_CODES.get(month_char)
-    if not month:
-        raise ValueError(f"Invalid series month character: '{month_char}'")
-    year_prefix = ref_date.year // 100
-    year_suffix = int(series_code[1:])
-    year = year_prefix * 100 + year_suffix
-    return get_contract_last_trading_day(year, month)
-
+# Section 3 (dynamic series & expiration calculation) moved to tfex_common.calendar.
 
 # ==============================================================================
 # 4. TURSO INTRADAY DATASET LOADER (STRICT VALIDATION)
 # ==============================================================================
-
-def _to_decimal_rate(val: Optional[float], label: str = "") -> Optional[float]:
-    """
-    Converts a BOT THOR reading into a decimal annual rate.
-
-    THOR is ALWAYS published as percent per annum, so divide by 100
-    unconditionally. The previous heuristic (`val / 100 if val > 0.5 else val`)
-    silently turned 0.45% into 45%: exp(-r*T) then collapsed from 0.9996 to
-    0.9637 at 30 DTE, which fabricates ~1.8 index points of parity edge
-    (0.60 points of commission, so the alert fires) out of thin air.
-    """
-    if val is None:
-        return None
-    pct = float(val)
-    if pct <= 0:
-        return None
-    if pct > THOR_MAX_PCT:
-        raise ValueError(
-            f"THOR rate out of range: {pct} ({label}) — expected percent p.a., "
-            f"max {THOR_MAX_PCT}%"
-        )
-    return pct / 100.0
-
-
-def select_dynamic_thor_rate(
-    thor_record: Dict[str, Optional[float]],
-    dte: int
-) -> Tuple[float, str]:
-    """
-    Selects the dynamic THOR rate matching the option's DTE (Days to Expiration).
-    
-    Tenor Selection Rules:
-    - dte <= 30 days:
-        Prefer 1M Compounded ('1m')
-        Fallback: Overnight ('overnight')
-    - 30 < dte <= 90 days:
-        Prefer 3M Compounded ('3m')
-        Fallback: 1M Compounded ('1m') -> Overnight ('overnight')
-    - 90 < dte <= 180 days:
-        Prefer 6M Compounded ('6m')
-        Fallback: 3M Compounded ('3m') -> 1M Compounded -> Overnight
-    - dte > 180 days:
-        Prefer 6M Compounded ('6m')
-        Fallback: 3M Compounded -> Overnight
-        
-    Returns:
-        (rate_decimal, tenor_label) where rate_decimal is in decimal form (e.g. 0.00995)
-    """
-    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
-    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
-    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
-    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
-
-    if dte <= 30:
-        candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
-    elif dte <= 90:
-        candidates = [("3M", r_3m), ("1M", r_1m), ("ON", r_on), ("6M", r_6m)]
-    elif dte <= 180:
-        candidates = [("6M", r_6m), ("3M", r_3m), ("1M", r_1m), ("ON", r_on)]
-    else:
-        candidates = [("6M", r_6m), ("3M", r_3m), ("ON", r_on), ("1M", r_1m)]
-
-    for label, rate in candidates:
-        if rate is not None and rate > 0:
-            return rate, label
-
-    raise ValueError(f"No valid THOR rate found in record: {thor_record}")
-
-
-def fetch_thor_rates_record(pipeline_url: str, auth_token: str) -> Dict[str, Optional[float]]:
-    sql_thor = "SELECT thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates ORDER BY trade_date DESC LIMIT 1;"
-    _, rows_thor = execute_turso_sql(pipeline_url, auth_token, sql_thor)
-    if not rows_thor or rows_thor[0][0] is None:
-        raise ValueError("No record found in eod_thor_rates table or value is NULL.")
-    
-    row = rows_thor[0]
-    return {
-        "overnight": float(row[0]) if len(row) > 0 and row[0] is not None else None,
-        "1m": float(row[1]) if len(row) > 1 and row[1] is not None else None,
-        "3m": float(row[2]) if len(row) > 2 and row[2] is not None else None,
-        "6m": float(row[3]) if len(row) > 3 and row[3] is not None else None,
-    }
-
-
-def fetch_thor_rate(pipeline_url: str, auth_token: str, dte: Optional[int] = None) -> float:
-    thor_rec = fetch_thor_rates_record(pipeline_url, auth_token)
-    if dte is not None:
-        rate, _ = select_dynamic_thor_rate(thor_rec, dte)
-        return rate
-    rate, _ = select_dynamic_thor_rate(thor_rec, 42)
-    return rate
 
 
 def fetch_intraday_arb_dataset(
@@ -1124,86 +875,9 @@ def scan_calendar_spreads(
 
 
 # ==============================================================================
-# 6. TELEGRAM HTML FORMATTER & ALERT DISPATCHER
+# 6. ORDER TICKETS & TELEGRAM HTML FORMATTERS
 # ==============================================================================
-
-def escape_telegram_html(text: str) -> str:
-    pattern = r"</?(?:b|i|code|pre|a)(?:\s+[^>]+)?>"
-    placeholder_map = {}
-
-    def repl_tag(m):
-        tok = f"___TAG_HOLD_{len(placeholder_map)}___"
-        placeholder_map[tok] = m.group(0)
-        return tok
-
-    tokenized = re.sub(pattern, repl_tag, text, flags=re.IGNORECASE)
-    tokenized = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", tokenized)
-    tokenized = tokenized.replace("<", "&lt;").replace(">", "&gt;")
-    for tok, orig in placeholder_map.items():
-        tokenized = tokenized.replace(tok, orig)
-
-    return tokenized
-
-
-def send_telegram_alert(bot_token: str, chat_id: str, message_html: str) -> bool:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    sanitized_html = escape_telegram_html(message_html)
-    payload = {
-        "chat_id": chat_id,
-        "text": sanitized_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=25)
-        print(f"[TELEGRAM] HTTP Status: {r.status_code}")
-        if r.status_code == 200 and r.json().get("ok"):
-            print("[TELEGRAM] Arbitrage notification delivered successfully.")
-            return True
-        else:
-            print(f"[TELEGRAM] Error: sendMessage failed with HTTP {r.status_code}: {r.text[:200]}")
-            return False
-    except Exception as e:
-        # ห้าม log ตัว exception ดิบ: requests ใส่ URL เต็ม (ซึ่งมี bot token) ลงใน
-        # ข้อความของ ConnectionError/Timeout และ repo นี้เป็น public
-        # → log ของ GitHub Actions อ่านได้โดยใครก็ได้
-        print(f"[TELEGRAM] Exception sending alert: {type(e).__name__} (URL/token redacted)")
-        return False
-
-
-def send_telegram_document(
-    bot_token: str,
-    chat_id: str,
-    file_bytes: bytes,
-    filename: str,
-    caption: Optional[str] = None
-) -> bool:
-    """
-    Sends a file (e.g. .xlsx Multiple Order template) to Telegram using sendDocument API.
-    """
-    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    files = {
-        "document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    }
-    data = {
-        "chat_id": chat_id
-    }
-    if caption:
-        data["caption"] = caption
-        data["parse_mode"] = "HTML"
-
-    try:
-        r = requests.post(url, data=data, files=files, timeout=25)
-        print(f"[TELEGRAM] sendDocument Status: {r.status_code}")
-        if r.status_code == 200 and r.json().get("ok"):
-            print(f"[TELEGRAM] Streaming Multi-Order document '{filename}' delivered successfully.")
-            return True
-        else:
-            print(f"[TELEGRAM] Error: sendDocument failed with HTTP {r.status_code}: {r.text}")
-            return False
-    except Exception as e:
-        print(f"[TELEGRAM] Exception sending document: {type(e).__name__} (URL/token redacted)")
-        return False
+# Alert/document dispatch itself lives in tfex_common.telegram (redaction-safe).
 
 
 def resolve_order_legs(opp: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2477,7 +2151,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         print("[ERROR] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not configured in environment.")
         sys.exit(1)
 
-    pipeline_url = f"{turso_url.replace('libsql://', 'https://').rstrip('/')}/v2/pipeline"
+    pipeline_url = normalize_turso_url(turso_url)
 
     # Concurrency Guard
     if is_arb_worker_active(pipeline_url, turso_token, session_mode, now_bkk):
@@ -2525,7 +2199,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
             summary_title = "สรุปภาพรวมวันหมดอายุ (09:45–16:30 น.)"
     else:
         T_years = dte / 365.0
-    thor_record = fetch_thor_rates_record(pipeline_url, turso_token)
+    thor_record = fetch_thor_rates_record(execute_turso_sql, pipeline_url, turso_token)
     thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
     print("=" * 75)
@@ -2803,7 +2477,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
                                 thor_tenor=thor_tenor
                             )
                             if not no_telegram and tg_token and tg_chat_id:
-                                send_telegram_alert(tg_token, tg_chat_id, live_msg)
+                                send_telegram_alert(tg_token, tg_chat_id, live_msg, escape=True)
                                 # Record alert cooldown only after REST verification succeeds and alert is dispatched
                                 for opp_alerted in ranked_alertable:
                                     cooldown.record_alert(opp_alerted, curr_bkk)
@@ -2854,7 +2528,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
         )
         print(f"[ABORT] Zero records for session summary.")
         if not no_telegram and tg_token and tg_chat_id:
-            send_telegram_alert(tg_token, tg_chat_id, abort_msg)
+            send_telegram_alert(tg_token, tg_chat_id, abort_msg, escape=True)
         sys.exit(1)
 
     p_opps, near_p, d1, e1, p_mins = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
@@ -2902,7 +2576,7 @@ def run_arb_worker(session_mode: str, target_date: Optional[str] = None, no_tele
     print("=" * 75)
 
     if not no_telegram and tg_token and tg_chat_id:
-        send_telegram_alert(tg_token, tg_chat_id, summary_msg)
+        send_telegram_alert(tg_token, tg_chat_id, summary_msg, escape=True)
     else:
         print("[TELEGRAM] --no-telegram supplied or credentials missing. Summary dispatch skipped.")
 
@@ -2925,7 +2599,7 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         print("[ERROR] TURSO_DATABASE_URL or TURSO_AUTH_TOKEN not configured in environment.")
         sys.exit(1)
 
-    pipeline_url = f"{turso_url.replace('libsql://', 'https://').rstrip('/')}/v2/pipeline"
+    pipeline_url = normalize_turso_url(turso_url)
 
     sess_upper = session_name.upper()
     if sess_upper == "MIDDAY":
@@ -2956,7 +2630,7 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
             sess_title = "ปิดตลาดวันหมดอายุ (09:45–16:30 น.)"
     else:
         T_years = dte / 365.0
-    thor_record = fetch_thor_rates_record(pipeline_url, turso_token)
+    thor_record = fetch_thor_rates_record(execute_turso_sql, pipeline_url, turso_token)
     thor_rate, thor_tenor = select_dynamic_thor_rate(thor_record, dte)
 
     grouped_data, fut_cnt, opt_cnt = fetch_intraday_arb_dataset(
@@ -2976,7 +2650,7 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
         )
         print(f"[ABORT] Zero records for session {sess_title}.")
         if not no_telegram and tg_token and tg_chat_id:
-            send_telegram_alert(tg_token, tg_chat_id, abort_msg)
+            send_telegram_alert(tg_token, tg_chat_id, abort_msg, escape=True)
         sys.exit(1)
 
     p_opps, near_p, d1, e1, p_mins = scan_put_call_parity(grouped_data, front_series, thor_rate, T_years)
@@ -3024,7 +2698,7 @@ def run_single_scan(session_name: str, target_date: Optional[str] = None, no_tel
     print("=" * 75)
 
     if not no_telegram and tg_token and tg_chat_id:
-        send_telegram_alert(tg_token, tg_chat_id, report_msg)
+        send_telegram_alert(tg_token, tg_chat_id, report_msg, escape=True)
     else:
         print("[TELEGRAM] --no-telegram supplied or credentials missing. Dispatch skipped.")
 

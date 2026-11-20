@@ -40,6 +40,12 @@
 
 ---
 
+## 🧩 โค้ดที่ใช้ร่วมกับ repo อื่น (tfex-common)
+
+ปฏิทิน SET / expiry, THOR unit handling, Turso client และ Telegram dispatch ไม่ได้อยู่ในไฟล์นี้แล้ว — import จาก [`tfex-common`](https://github.com/met37818-stack/tfex-common) (ปักหมุด tag ใน `requirements.txt`) เพื่อให้ทั้ง 4 repo ใช้โค้ดชุดเดียวกัน
+
+> `BANGKOK_TZ` ยังเป็น `pytz` ในไฟล์นี้โดยเจตนา เพราะโค้ดใช้ `.localize()` ซึ่ง tzinfo แบบ fixed-offset ของ package ไม่มีให้
+
 ## ⏰ รอบการทำงานอัตโนมัติ (Triggered via cron-job.org)
 
 ปลุก Persistent Worker ผ่าน GitHub Actions REST API (`workflow_dispatch`) วันละ 2 รอบล่วงหน้าก่อนตลาดเปิด 5 นาที:
